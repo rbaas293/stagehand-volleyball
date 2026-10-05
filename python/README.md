@@ -6,7 +6,7 @@ Python port of the root TypeScript scraper (`../index.ts`), using the
 
 Same flow as TypeScript:
 
-1. Load `config.json` (prefers **`../config.json`** so one file drives both languages; falls back to `python/config.json`).
+1. Load `config.yaml` with PyYAML `safe_load` (prefers **`../config.yaml`** so one file drives both languages; falls back to `python/config.yaml`).
 2. Launch Chrome via `local_browser.launch()`, or Browserbase if `BROWSERBASE_API_KEY` is set.
 3. Open the division **Standings** page → `stagehand.extract()` with pydantic models → resolve team(s) by `captainName` (preferred) or `teamName`.
 4. Open **Schedule** → `stagehand.act()` to click each week tab → `extract()` games for matched teams.
@@ -26,7 +26,7 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env               # or reuse the repo-root .env
-# edit ../config.json (shared) — captainName / teamName / day / league / leagueUrl
+# edit ../config.yaml (shared) — captainName / teamName / day / league / leagueUrl
 export OPENAI_API_KEY=...          # if not using .env
 python main.py
 ```
@@ -35,7 +35,7 @@ python main.py
 
 ## Config
 
-Uses the same fields as the TypeScript scraper — see the root [README](../README.md#config-configjson).
+Uses the same fields as the TypeScript scraper — see the root [README](../README.md#config-configyaml). The file is YAML (comments allowed); start from `../config.example.yaml`.
 
 | Field | Required | Purpose |
 |---|---|---|

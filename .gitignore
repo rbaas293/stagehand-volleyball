@@ -10,3 +10,8 @@ python/venv/
 **/__pycache__/
 *.py[cod]
 python/games.json
+# Config: config.yaml (shared by TS + Python) is tracked on purpose.
+# The old JSON config was replaced by YAML; ignore stale local copies.
+config.json
+config.example.json
+python/config.json

@@ -3,11 +3,11 @@
 Scrapes a volleyball team's schedule from a [league.ninja](https://league.ninja) division page with
 [Stagehand v4](https://docs.stagehand.dev/v4/first-steps/quickstart) (`@browserbasehq/stagehand`).
 
-Default target (editable in `config.json`): captain **H. Robinson** → **Win or Lose We Booze**, Sunday Beer A at Flannagan's, Summer III 2026.
+Default target (editable in `config.yaml`): captain **H. Robinson** → **Win or Lose We Booze**, Sunday Beer A at Flannagan's, Summer III 2026.
 
 What it does:
 
-1. Loads `config.json` (optional captain name and/or team name, day, league label, division URL).
+1. Loads `config.yaml` (optional captain name and/or team name, day, league label, division URL).
 2. Launches Chrome (`localBrowser.launch()`), or a Browserbase cloud browser if `BROWSERBASE_API_KEY` is set.
 3. Opens the division **Standings** page and uses `stagehand.extract()` (zod schema) to get the league name, division name, and every standings row (team + captain + W-L + rank).
 4. **Resolves which team(s) to scrape** (see [Team resolution](#team-resolution) below).
@@ -22,9 +22,9 @@ What it does:
 - Google Chrome installed (for local mode).
 - pnpm (or npm).
 
-## Config (`config.json`)
+## Config (`config.yaml`)
 
-Edit **`config.json`** to change the captain, team, day, league label, or division URL. Copy from `config.example.json` if you need a fresh template.
+Edit **`config.yaml`** to change the captain, team, day, league label, or division URL. Copy from `config.example.yaml` if you need a fresh template (`cp config.example.yaml config.yaml`). Both files are commented; lines starting with `#` are ignored. Keep string values in double quotes so characters like `:` or `#` are never misread.
 
 | Field | Required | Purpose |
 |---|---|---|
@@ -39,31 +39,27 @@ You must set **at least one** of `captainName` or `teamName`.
 
 Example (captain-driven — recommended when you know the captain from standings):
 
-```json
-{
-  "captainName": "H. Robinson",
-  "teamName": "Win or Lose We Booze",
-  "day": "Sunday",
-  "league": "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E",
-  "leagueUrl": "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a",
-  "schedulePathSuffix": "/schedule"
-}
+```yaml
+captainName: "H. Robinson"
+teamName: "Win or Lose We Booze"
+day: "Sunday"
+league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
+leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
+schedulePathSuffix: "/schedule"
 ```
 
 Example (team-only — leave `captainName` empty or omit it):
 
-```json
-{
-  "teamName": "Win or Lose We Booze",
-  "day": "Sunday",
-  "league": "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E",
-  "leagueUrl": "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
-}
+```yaml
+teamName: "Win or Lose We Booze"
+day: "Sunday"
+league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
+leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
 ```
 
 `leagueUrl` should be the division page (the Standings tab). The script builds the schedule URL from `leagueUrl` + `schedulePathSuffix`.
 
-If `config.json` is missing or invalid, the scraper exits with a clear error before launching Chrome.
+If `config.yaml` is missing, not valid YAML, or fails validation, the scraper exits with a clear error before launching Chrome.
 
 ### Team resolution
 
@@ -142,5 +138,5 @@ When resolving by captain, `captainSearched` is the config string you searched f
 
 ## Python version
 
-A thoroughly commented Python port lives in [`python/`](./python/), using the Stagehand Python SDK (`pip install stagehand`) with the same act / extract / observe flow and the same shared `config.json`. See [`python/README.md`](./python/README.md).
+A thoroughly commented Python port lives in [`python/`](./python/), using the Stagehand Python SDK (`pip install stagehand`) with the same act / extract / observe flow and the same shared `config.yaml`. See [`python/README.md`](./python/README.md).
 
