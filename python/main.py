@@ -6,7 +6,8 @@ This mirrors the TypeScript scraper in ../index.ts:
   1. Load config (captainName / teamName / day / league / leagueUrl).
   2. Launch a local Chrome browser (or Browserbase cloud browser).
   3. Open standings → extract rows with pydantic → resolve team(s) by captain or team name.
-  4. Open schedule → act() to click each week tab → extract() that week's games.
+  4. Open schedule → click each week tab (exact text, act() fallback), verify it is
+     selected → extract() that week's games.
   5. Write games.json next to this script (and print JSON to stdout).
 
 Run (from this folder):
@@ -40,12 +41,13 @@ import json             # Parse config.json and serialize games.json
 import os               # Read env vars (OPENAI_API_KEY, HEADLESS, …)
 import re               # Match week-tab labels (Week / TOURNAMENT / …)
 import sys              # Exit codes + stderr logging
+from urllib.parse import urlparse        # Validate leagueUrl is a real http(s) URL
 from datetime import datetime, timezone  # scrapedAt timestamp (UTC ISO-8601)
 from pathlib import Path                 # Config / output paths without string concat
 from typing import Any, Literal          # Typing for status enum + loose JSON bits
 
 # ---- Third-party ------------------------------------------------------------
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from stagehand import Stagehand, browserbase, local_browser
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,30 @@ class ResolveError(Exception):
     """Raised when captainName / teamName matches no standings row."""
 
 
+class WeekTabError(Exception):
+    """
+    Raised when a schedule week tab can't be selected (or the wrong tab ends up
+    selected) even after a retry. We stop instead of extracting, because
+    extract() would read whatever week is still on screen and save those games
+    under the wrong label (or duplicate the previous week) with no error.
+    """
+
+
+def describe_error(err: BaseException) -> str:
+    """
+    Turn any exception into a non-empty, human-readable message.
+
+    Some exceptions (e.g. a bare TimeoutError() or CancelledError()) have an
+    empty str(), which would print a blank line and leave the user guessing.
+    Fall back to repr() and always lead with the exception type name.
+    """
+    text = str(err).strip()
+    if not text:
+        # repr() is at least "TimeoutError()"; the type name is the last resort.
+        text = repr(err) or type(err).__name__
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Config model (mirrors ConfigSchema in index.ts)
 # ---------------------------------------------------------------------------
@@ -94,12 +120,28 @@ class AppConfig(BaseModel):
     # Human-readable league / division path for your own notes.
     league: str = Field(min_length=1)
     # Division standings URL; the script appends schedulePathSuffix for the schedule page.
-    league_url: str = Field(alias="leagueUrl")
+    # min_length=1 rejects "" outright; the validator below also rejects
+    # whitespace-only / non-URL values (zod's .url() does the same in index.ts).
+    league_url: str = Field(min_length=1, alias="leagueUrl")
     # Path appended to leagueUrl to reach the schedule tab (default "/schedule").
     schedule_path_suffix: str = Field(default="/schedule", alias="schedulePathSuffix")
 
     # Allow reading camelCase JSON keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
+
+    @field_validator("league_url")
+    @classmethod
+    def require_http_url(cls, value: str) -> str:
+        """Reject empty / whitespace-only / non-http(s) leagueUrl values."""
+        stripped = value.strip()
+        parsed = urlparse(stripped)
+        # Need both a scheme (http/https) and a host, e.g. https://x.league.ninja/...
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "leagueUrl must be a non-empty http(s) URL, e.g. "
+                "https://<club>.league.ninja/leagues/division/<id>"
+            )
+        return stripped
 
     @model_validator(mode="after")
     def require_captain_or_team(self) -> "AppConfig":
@@ -116,18 +158,24 @@ class AppConfig(BaseModel):
 
 def load_dotenv_files() -> None:
     """
-    Optionally load ../.env then python/.env into os.environ (without overriding
-    vars already set in the shell). Keeps secrets out of the repo; .env is gitignored.
+    Optionally load python/.env and ../.env into os.environ. Keeps secrets out
+    of the repo; .env is gitignored.
+
+    Precedence (highest first): shell exports > python/.env > ../.env (repo root).
+    Every load is "first one wins" (never overrides a var that's already set),
+    so we load the higher-priority file FIRST: python/.env, then the root .env
+    only fills in whatever is still missing.
     """
     # Try python-dotenv if installed; otherwise do a tiny manual parser so the
     # scraper still works with only `pip install stagehand`.
-    candidates = [ROOT.parent / ".env", ROOT / ".env"]
+    # Order matters: python/.env before ../.env (see precedence above).
+    candidates = [ROOT / ".env", ROOT.parent / ".env"]
     try:
         from dotenv import load_dotenv  # type: ignore
 
         for path in candidates:
             if path.is_file():
-                # override=False: shell exports win over .env values.
+                # override=False: shell exports (and earlier files) win.
                 load_dotenv(path, override=False)
         return
     except ImportError:
@@ -144,7 +192,7 @@ def load_dotenv_files() -> None:
             key, _, value = stripped.partition("=")
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            # Never clobber an env var the user already exported.
+            # Never clobber an env var the user exported or an earlier file set.
             if key and key not in os.environ:
                 os.environ[key] = value
 
@@ -416,16 +464,140 @@ async def list_week_tab_labels(page) -> list[str]:
     return [str(t) for t in raw if isinstance(t, str) and _WEEK_TAB_RE.search(t)]
 
 
-async def click_week_tab(stagehand: Stagehand, label: str) -> None:
+def normalize_tab_label(text: str) -> str:
     """
-    Select a schedule week tab via stagehand.act() (natural-language click).
+    Canonical form for comparing tab labels: collapse every run of whitespace
+    (spaces, newlines, tabs) to one space, trim, and casefold. So
+    "Week 5\n- Oct 4" and "week 5 - oct 4" compare equal.
+    """
+    return " ".join(str(text).split()).casefold()
 
-    Using act() (instead of a brittle CSS click) matches the Stagehand
-    act / extract / observe flow and survives minor DOM churn on league.ninja.
+
+async def click_tab_by_exact_text(page, label: str) -> bool:
     """
-    await stagehand.act(
-        f'Click the schedule week tab labeled exactly "{label}". '
-        "It is one of the tabs in the week/round tab list on the schedule page."
+    Deterministic click, same as the TypeScript scraper: find the role=tab
+    whose whitespace-normalized innerText equals `label` and click() it.
+
+    Returns True if a matching tab element was found (and clicked), else False.
+    No LLM call, so it's fast and can't pick a "similar-looking" tab.
+    """
+    # json.dumps gives a safely quoted JS string literal for the label.
+    label_js = json.dumps(label)
+    found = await page.evaluate(
+        f"""(() => {{
+          const wanted = {label_js};
+          const norm = (t) => t.replace(/\\s+/g, ' ').trim().toLowerCase();
+          const tab = Array.from(document.querySelectorAll('[role=tablist] [role=tab]'))
+            .find((el) => norm(el.innerText) === norm(wanted));
+          if (!tab) return false;
+          tab.click();
+          return true;
+        }})()"""
+    )
+    return bool(found)
+
+
+async def selected_tab_labels(page) -> list[str]:
+    """
+    Return the text of every currently selected tab
+    ([role=tab][aria-selected=true]), whitespace-collapsed.
+
+    The page can have more than one tablist (e.g. Standings/Schedule at the
+    top plus the week tabs), so there may be several selected tabs; the
+    caller checks whether ANY of them is the week we asked for.
+    """
+    raw = await page.evaluate(
+        """(() => {
+          return Array.from(document.querySelectorAll('[role=tab][aria-selected=true]'))
+            .map((el) => el.innerText.replace(/\\s+/g, ' ').trim());
+        })()"""
+    )
+    if not isinstance(raw, list):
+        return []
+    return [str(t) for t in raw if isinstance(t, str)]
+
+
+async def wait_for_selected_tab(page, label: str, timeout_ms: int = 3_000) -> bool:
+    """
+    Poll until a selected tab's text equals `label` (case- and
+    whitespace-insensitive), or until timeout_ms elapses.
+
+    Polling (instead of one fixed sleep) tolerates slow React re-renders
+    without waiting the full timeout when the tab switches quickly.
+    """
+    wanted = normalize_tab_label(label)
+    step_ms = 250
+    waited = 0
+    while True:
+        selected = await selected_tab_labels(page)
+        if any(normalize_tab_label(t) == wanted for t in selected):
+            return True
+        if waited >= timeout_ms:
+            return False
+        await page.wait_for_timeout(step_ms)
+        waited += step_ms
+
+
+async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
+    """
+    Select a schedule week tab and VERIFY it is actually selected.
+
+    Why verify: extract() reads whatever week is on screen. If a click silently
+    fails or hits a neighboring tab, we'd save the previous week's games under
+    this label (or duplicate them) with no error. So after clicking we confirm
+    [role=tab][aria-selected=true] text == label before returning.
+
+    Strategy per attempt:
+      1. Exact-text DOM click (same as the TypeScript version): fast, no LLM.
+      2. If the tab still isn't selected, fall back to stagehand.act()
+         (natural-language click), which survives DOM changes where the tab
+         text/markup no longer matches exactly. We also check act()'s own
+         success flag so a failed action is reported, not ignored.
+
+    We make 2 attempts (the initial try + one retry). If the tab is still not
+    selected, raise WeekTabError with what we expected vs. what is selected.
+    """
+    max_attempts = 2  # initial attempt + one retry
+    problems: list[str] = []  # Collected per-step failures for the final error
+
+    for attempt in range(1, max_attempts + 1):
+        # --- Step 1: deterministic exact-text click (TS parity) ---------------
+        if await click_tab_by_exact_text(page, label):
+            if await wait_for_selected_tab(page, label):
+                return
+            problems.append(f"attempt {attempt}: exact-text click did not select the tab")
+        else:
+            problems.append(f"attempt {attempt}: no tab with exact text found")
+
+        # --- Step 2: act() fallback --------------------------------------------
+        try:
+            act_result = await stagehand.act(
+                f'Click the schedule week tab labeled exactly "{label}". '
+                "It is one of the tabs in the week/round tab list on the schedule page."
+            )
+            # ActResult.data.success / .message (Stagehand v4 Python SDK).
+            # getattr keeps this tolerant of minor SDK shape changes.
+            data = getattr(act_result, "data", None)
+            if data is not None and getattr(data, "success", True) is False:
+                problems.append(
+                    f"attempt {attempt}: act() reported failure: "
+                    f"{getattr(data, 'message', '') or 'no message'}"
+                )
+        except Exception as err:  # noqa: BLE001 — record and keep trying / raise below
+            problems.append(f"attempt {attempt}: act() raised {describe_error(err)}")
+
+        # Trust the DOM, not act()'s self-report: only a matching selected tab counts.
+        if await wait_for_selected_tab(page, label):
+            return
+        problems.append(f"attempt {attempt}: act() did not select the tab")
+
+    # Out of attempts: report what IS selected so the mismatch is obvious.
+    selected = await selected_tab_labels(page)
+    raise WeekTabError(
+        f'Could not select schedule week tab "{label}" after {max_attempts} attempts. '
+        f"Currently selected tab(s): {selected or 'none'}. "
+        f"Details: {'; '.join(problems)}. "
+        "Stopping so games aren't saved under the wrong week."
     )
 
 
@@ -533,7 +705,7 @@ async def scrape() -> dict[str, Any]:
             )
 
             # ---------------------------------------------------------------
-            # 2) Schedule: act() through each week tab, extract() games.
+            # 2) Schedule: select + verify each week tab, extract() games.
             # ---------------------------------------------------------------
             log(f"Opening schedule: {schedule_url}")
             await page.goto(schedule_url, wait_until="networkidle", timeout=60_000)
@@ -549,9 +721,12 @@ async def scrape() -> dict[str, Any]:
             team_names_csv = ", ".join(team_names)
 
             for label in week_labels:
-                # Natural-language click via act() (required Python flow).
-                await click_week_tab(stagehand, label)
-                await page.wait_for_timeout(1_500)
+                # Exact-text click (act() fallback), then verify the selected
+                # tab really is `label`; raises WeekTabError if it never is.
+                await click_week_tab(stagehand, page, label)
+                # Short settle so the week's match cards finish rendering
+                # after aria-selected flips.
+                await page.wait_for_timeout(750)
 
                 # Skip LLM when none of our teams appear in this week's DOM.
                 if not await page_mentions_any_team(page, team_names):
@@ -639,12 +814,17 @@ def main() -> None:
     """CLI entrypoint: translate known errors into clean stderr + exit 1."""
     try:
         asyncio.run(async_main())
-    except (ConfigError, MissingKeyError, ResolveError) as err:
-        # Friendly one-liners for config / key / resolve failures.
-        print(err, file=sys.stderr)
+    except (ConfigError, MissingKeyError, ResolveError, WeekTabError) as err:
+        # Friendly one-liners for config / key / resolve / week-tab failures.
+        # describe_error() never returns an empty string.
+        print(describe_error(err), file=sys.stderr)
         sys.exit(1)
     except Exception as err:  # noqa: BLE001 — surface unexpected failures fully
-        print(err, file=sys.stderr)
+        # Prefix the type name ("KeyError: 'x'") so unexpected failures are
+        # identifiable. When str(err) was empty, describe_error() already
+        # returned repr(err) (e.g. "TimeoutError()"), so don't repeat the name.
+        msg = describe_error(err)
+        print(msg if msg == repr(err) else f"{type(err).__name__}: {msg}", file=sys.stderr)
         sys.exit(1)
 
 
