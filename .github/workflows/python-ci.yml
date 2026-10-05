@@ -1,21 +1,3 @@
-# SOURCE COPY for review. GitHub Actions only loads files under
-# .github/workflows/. After granting the `workflow` OAuth scope
-# (gh auth refresh -s workflow), copy this file to
-# .github/workflows/python-ci.yml on branch ci-python.
-#
-# Python CI: gate on the scraper PR, then lint/test, build wheels, build shiv binaries.
-#
-# Independent of the config.yaml migration PR. This workflow lives on its own
-# branch (ci-python) and only cares about the Python scraper packaging surface.
-#
-# Gate: the checks/wheels/shiv jobs need `gate-scraper-pr`, which passes only
-# when SCRAPER_PR_NUMBER (default #1, add-python-stagehand) is merged. Until
-# that merge, the gate fails and dependent jobs are skipped — that is expected.
-#
-# Manual override: workflow_dispatch input `skip_gate=true` lets you exercise
-# lint/build/shiv on Actions before #1 merges. Do not use skip_gate on the
-# default push/pull_request path; it exists only for deliberate verification.
-
 name: Python CI
 
 on:
