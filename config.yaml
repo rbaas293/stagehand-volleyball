@@ -5,10 +5,15 @@
 # You must set at least one of captainName or teamName.
 # Keep string values in double quotes so characters like ":" or "#" are never misread.
 
-# Captain to search for on the standings page (preferred discovery path).
-# Case-insensitive; partial match OK ("Robinson" matches "H. Robinson").
-# Leave empty ("") or delete this line to use teamName instead.
-captainName: "H. Robinson"
+# Captain(s) to search for on the standings page (preferred discovery path).
+# Accepts a single string OR a YAML list. Case- and punctuation-insensitive
+# partial match ("Robinson" matches "H. Robinson"; "R Baas" matches "R. Baas").
+# Leave empty ("") / [] or delete this line to use teamName instead.
+captainName:
+  - "H. Robinson"
+  - "Ryan Baas"
+  - "R. Baas"
+  - "R Baas"
 
 # Explicit team name. Used only when captainName is empty/absent.
 teamName: "Win or Lose We Booze"

@@ -39,7 +39,7 @@ Uses the same fields as the TypeScript scraper — see the root [README](../READ
 
 | Field | Required | Purpose |
 |---|---|---|
-| `captainName` | one of captain/team | Discover team(s) from standings by captain (partial, case-insensitive) |
+| `captainName` | one of captain/team | Discover team(s) from standings by captain. String or YAML list; partial, case- and punctuation-insensitive (`"R Baas"` ≡ `"R. Baas"`) |
 | `teamName` | one of captain/team | Explicit team when `captainName` is empty |
 | `day` | yes | Stored in output |
 | `league` | yes | Human label |

@@ -40,9 +40,20 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(ROOT, "config.yaml");
 
 // ---- Config (captain / team / day / league / URL) --------------------------
+/** Coerce captainName: string | string[] → trimmed non-empty string[]. */
+const CaptainNameSchema = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .transform((v): string[] => {
+    if (v == null) return [];
+    const list = Array.isArray(v) ? v : [v];
+    return list.map((s) => s.trim()).filter(Boolean);
+  });
+
 const ConfigSchema = z
   .object({
-    captainName: z.string().optional().default(""),
+    // Single string or YAML list; normalized to string[] by CaptainNameSchema.
+    captainName: CaptainNameSchema,
     teamName: z.string().optional().default(""),
     day: z.string().min(1),
     league: z.string().min(1),
@@ -53,13 +64,13 @@ const ConfigSchema = z
     schedulePathSuffix: z.string().optional().default("/schedule"),
   })
   .superRefine((val, ctx) => {
-    const hasCaptain = Boolean(val.captainName?.trim());
+    const hasCaptain = val.captainName.length > 0;
     const hasTeam = Boolean(val.teamName?.trim());
     if (!hasCaptain && !hasTeam) {
       ctx.addIssue({
         code: "custom",
         message:
-          "Set captainName (to discover team(s) by captain) and/or teamName (explicit team when captainName is empty).",
+          "Set captainName (string or list, to discover team(s) by captain) and/or teamName (explicit team when captainName is empty).",
         path: ["captainName"],
       });
     }
@@ -75,7 +86,7 @@ function loadConfig(): AppConfig {
     const why = err instanceof Error ? err.message : String(err);
     throw new ConfigError(
       `Missing or unreadable config.yaml at ${CONFIG_PATH} (${why}). ` +
-        `Copy config.example.yaml to config.yaml and edit captainName and/or teamName, day, league, and leagueUrl.`,
+        `Copy config.example.yaml to config.yaml and edit captainName (string or list) and/or teamName, day, league, and leagueUrl.`,
     );
   }
   let parsed: unknown;
@@ -103,10 +114,11 @@ class MissingKeyError extends Error {}
 class ResolveError extends Error {}
 
 const config = loadConfig();
-const CAPTAIN_NAME = config.captainName?.trim() ?? "";
+/** Normalized list of captain queries (from string or list in config.yaml). */
+const CAPTAIN_NAMES: string[] = config.captainName;
 const CONFIG_TEAM_NAME = config.teamName?.trim() ?? "";
-/** Prefer captainName for discovery; fall back to teamName when captain is empty/absent. */
-const USE_CAPTAIN = CAPTAIN_NAME.length > 0;
+/** Prefer captainName for discovery; fall back to teamName when captain list is empty. */
+const USE_CAPTAIN = CAPTAIN_NAMES.length > 0;
 const LEAGUE_URL = config.leagueUrl.replace(/\/+$/, "");
 const SCHEDULE_URL = `${LEAGUE_URL}${config.schedulePathSuffix.startsWith("/") ? config.schedulePathSuffix : `/${config.schedulePathSuffix}`}`;
 /** Default xAI Grok id (structured outputs + tool use). Override via config.model or STAGEHAND_MODEL. */
@@ -166,28 +178,63 @@ const StandingsSchema = z.object({
 type Game = z.infer<typeof GameSchema>;
 type StandingsRow = z.infer<typeof StandingsRowSchema>;
 
+/** Lowercase, strip punctuation, collapse whitespace — so "R Baas" ≡ "R. Baas". */
+function normalizeCaptain(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function captainMatches(rowCaptain: string | undefined, wanted: string): boolean {
   if (!rowCaptain || !wanted) return false;
-  const a = rowCaptain.toLowerCase().replace(/\s+/g, " ").trim();
-  const b = wanted.toLowerCase().replace(/\s+/g, " ").trim();
-  return a.includes(b) || b.includes(a);
+  const a = normalizeCaptain(rowCaptain);
+  const b = normalizeCaptain(wanted);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
 }
+
+type CaptainMatchDetail = {
+  query: string;
+  matchedTeams: StandingsRow[];
+};
 
 function resolveTeamsFromStandings(
   rows: StandingsRow[],
-): { matchedTeams: StandingsRow[]; resolution: "captain" | "teamName" } {
+): {
+  matchedTeams: StandingsRow[];
+  resolution: "captain" | "teamName";
+  captainMatchDetails: CaptainMatchDetail[];
+} {
   if (USE_CAPTAIN) {
-    const matched = rows.filter((r) => captainMatches(r.captainName, CAPTAIN_NAME));
+    const captainMatchDetails: CaptainMatchDetail[] = CAPTAIN_NAMES.map((query) => ({
+      query,
+      matchedTeams: rows.filter((r) => captainMatches(r.captainName, query)),
+    }));
+    // Deduplicate teams matched by any query (same team can match multiple aliases).
+    const seen = new Set<string>();
+    const matched: StandingsRow[] = [];
+    for (const detail of captainMatchDetails) {
+      for (const row of detail.matchedTeams) {
+        const key = row.teamName.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          matched.push(row);
+        }
+      }
+    }
     if (matched.length === 0) {
       const captains = rows
         .map((r) => r.captainName)
         .filter(Boolean)
         .join(", ");
+      const wanted = CAPTAIN_NAMES.map((n) => JSON.stringify(n)).join(", ");
       throw new ResolveError(
-        `No standings row matched captainName="${CAPTAIN_NAME}". Captains seen: ${captains || "(none extracted)"}.`,
+        `No standings row matched captainName=[${wanted}]. Captains seen: ${captains || "(none extracted)"}.`,
       );
     }
-    return { matchedTeams: matched, resolution: "captain" };
+    return { matchedTeams: matched, resolution: "captain", captainMatchDetails };
   }
 
   const wanted = CONFIG_TEAM_NAME.toLowerCase();
@@ -201,9 +248,9 @@ function resolveTeamsFromStandings(
         `No standings row matched teamName="${CONFIG_TEAM_NAME}". Teams seen: ${names || "(none extracted)"}.`,
       );
     }
-    return { matchedTeams: partial, resolution: "teamName" };
+    return { matchedTeams: partial, resolution: "teamName", captainMatchDetails: [] };
   }
-  return { matchedTeams: matched, resolution: "teamName" };
+  return { matchedTeams: matched, resolution: "teamName", captainMatchDetails: [] };
 }
 
 // ---- Setup helpers ---------------------------------------------------------
@@ -323,7 +370,7 @@ function gamesSchemaFor(teamNames: string[]) {
 async function main() {
   if (USE_CAPTAIN) {
     log(
-      `Config: captain="${CAPTAIN_NAME}"` +
+      `Config: captains=${JSON.stringify(CAPTAIN_NAMES)}` +
         (CONFIG_TEAM_NAME ? ` (config teamName="${CONFIG_TEAM_NAME}" ignored while captainName is set)` : "") +
         ` day="${config.day}" league="${config.league}"`,
     );
@@ -352,13 +399,25 @@ async function main() {
         StandingsSchema,
       );
 
-      const { matchedTeams, resolution } = resolveTeamsFromStandings(standings.rows ?? []);
+      const { matchedTeams, resolution, captainMatchDetails } = resolveTeamsFromStandings(standings.rows ?? []);
       const teamNames = matchedTeams.map((t) => t.teamName);
       log(
         `Resolved via ${resolution}: ${matchedTeams
           .map((t) => `"${t.teamName}" (captain=${t.captainName ?? "?"})`)
           .join(", ")}`,
       );
+      for (const detail of captainMatchDetails) {
+        if (detail.matchedTeams.length === 0) {
+          log(`  captain query ${JSON.stringify(detail.query)}: no team matched`);
+        } else {
+          log(
+            `  captain query ${JSON.stringify(detail.query)}: ` +
+              detail.matchedTeams
+                .map((t) => `"${t.teamName}" (captain=${t.captainName ?? "?"})`)
+                .join(", "),
+          );
+        }
+      }
 
       // 2) Schedule page: click through each week tab and extract that week's games for matched teams.
       log(`Opening schedule: ${SCHEDULE_URL}`);
@@ -416,7 +475,18 @@ async function main() {
       }
 
       const output = {
-        captainSearched: USE_CAPTAIN ? CAPTAIN_NAME : null,
+        captainSearched: USE_CAPTAIN ? (CAPTAIN_NAMES.length === 1 ? CAPTAIN_NAMES[0] : CAPTAIN_NAMES) : null,
+        captainMatchDetails: USE_CAPTAIN
+          ? captainMatchDetails.map((d) => ({
+              query: d.query,
+              matchedTeams: d.matchedTeams.map((t) => ({
+                teamName: t.teamName,
+                captainName: t.captainName,
+                record: t.record,
+                standing: t.standing,
+              })),
+            }))
+          : undefined,
         resolution,
         matchedTeams: matchedTeams.map((t) => ({
           teamName: t.teamName,

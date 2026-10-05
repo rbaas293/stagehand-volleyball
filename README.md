@@ -28,7 +28,7 @@ Edit **`config.yaml`** to change the captain, team, day, league label, or divisi
 
 | Field | Required | Purpose |
 |---|---|---|
-| `captainName` | one of captain/team | Captain to search for on the standings page (e.g. `"H. Robinson"`). Case-insensitive; partial match OK (`"Robinson"` matches `"H. Robinson"`). |
+| `captainName` | one of captain/team | Captain(s) to search for on the standings page. **String or YAML list** (e.g. `"H. Robinson"` or `["H. Robinson", "R Baas"]`). Case- and punctuation-insensitive partial match (`"Robinson"` → `"H. Robinson"`; `"R Baas"` → `"R. Baas"`). |
 | `teamName` | one of captain/team | Explicit team name. Used only when `captainName` is empty/absent. Ignored for discovery while `captainName` is set. |
 | `day` | yes | Game day label (e.g. `"Sunday"`) — stored in output for convenience |
 | `league` | yes | Human-readable league / division path for your own notes |
@@ -38,10 +38,15 @@ Edit **`config.yaml`** to change the captain, team, day, league label, or divisi
 
 You must set **at least one** of `captainName` or `teamName`.
 
-Example (captain-driven — recommended when you know the captain from standings):
+Example (captain-driven — string or list; recommended when you know the captain from standings):
 
 ```yaml
-captainName: "H. Robinson"
+captainName:
+  - "H. Robinson"
+  - "Ryan Baas"
+  - "R. Baas"
+  - "R Baas"
+# Or a single string: captainName: "H. Robinson"
 teamName: "Win or Lose We Booze"
 day: "Sunday"
 league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
@@ -66,7 +71,7 @@ If `config.yaml` is missing, not valid YAML, or fails validation, the scraper ex
 
 | Config | Behavior |
 |---|---|
-| `captainName` set (non-empty) | Prefer captain discovery. Extract all standings rows, keep every team whose captain matches `captainName` (case-insensitive, partial). Scrape **all games** for every matched team. `teamName` in config is ignored for discovery while captain is set. |
+| `captainName` set (non-empty) | Prefer captain discovery. Extract all standings rows, keep every team whose captain matches any entry in `captainName` (string or list; case- and punctuation-insensitive, partial). Scrape **all games** for every matched team. `teamName` in config is ignored for discovery while captain is set. |
 | `captainName` empty / omitted | Use `teamName` as an explicit override. Match that team on the standings page (exact, then case-insensitive substring). |
 
 If a captain captains more than one team in the division, every matching team is included and their games are merged into one `games` array (each game has a `team` field).

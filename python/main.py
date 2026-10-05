@@ -113,8 +113,9 @@ def describe_error(err: BaseException) -> str:
 class AppConfig(BaseModel):
     """User-editable knobs loaded from config.yaml."""
 
-    # Captain to search for on the standings page (preferred discovery path).
-    captain_name: str = Field(default="", alias="captainName")
+    # Captain(s) to search for on the standings page (preferred discovery path).
+    # Accepts a single string or a list in YAML; normalized to list[str].
+    captain_name: list[str] = Field(default_factory=list, alias="captainName")
     # Explicit team name; used only when captainName is empty/absent.
     team_name: str = Field(default="", alias="teamName")
     # Game-day label stored in the output for convenience (e.g. "Sunday").
@@ -134,6 +135,24 @@ class AppConfig(BaseModel):
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
 
+    @field_validator("captain_name", mode="before")
+    @classmethod
+    def coerce_captain_names(cls, value: Any) -> list[str]:
+        """Accept string or list; trim; drop empties. Backward-compatible with a single string."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return [trimmed] if trimmed else []
+        if isinstance(value, list):
+            out: list[str] = []
+            for item in value:
+                s = str(item).strip()
+                if s:
+                    out.append(s)
+            return out
+        raise ValueError("captainName must be a string or a list of strings")
+
     @field_validator("league_url")
     @classmethod
     def require_http_url(cls, value: str) -> str:
@@ -151,12 +170,12 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def require_captain_or_team(self) -> "AppConfig":
         """Same rule as the TS superRefine: at least one of captain/team must be set."""
-        has_captain = bool(self.captain_name.strip())
+        has_captain = len(self.captain_name) > 0
         has_team = bool(self.team_name.strip())
         if not has_captain and not has_team:
             raise ValueError(
-                "Set captainName (to discover team(s) by captain) and/or teamName "
-                "(explicit team when captainName is empty)."
+                "Set captainName (string or list, to discover team(s) by captain) "
+                "and/or teamName (explicit team when captainName is empty)."
             )
         return self
 
@@ -344,41 +363,65 @@ def games_schema_for(team_names: list[str]) -> type[BaseModel]:
 # ---------------------------------------------------------------------------
 # Team resolution helpers
 # ---------------------------------------------------------------------------
+def normalize_captain(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — so 'R Baas' ≡ 'R. Baas'."""
+    lowered = s.lower()
+    # Drop everything except letters, digits, and spaces.
+    cleaned = re.sub(r"[^a-z0-9\s]", "", lowered)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def captain_matches(row_captain: str | None, wanted: str) -> bool:
     """
-    Case-insensitive, whitespace-normalized partial match.
-    "Robinson" matches "H. Robinson" and vice versa (same as index.ts).
+    Case- and punctuation-insensitive partial match (same as index.ts).
+    "Robinson" matches "H. Robinson"; "R Baas" matches "R. Baas".
     """
     if not row_captain or not wanted:
         return False
-    a = re.sub(r"\s+", " ", row_captain.lower()).strip()
-    b = re.sub(r"\s+", " ", wanted.lower()).strip()
-    return a in b or b in a
+    a = normalize_captain(row_captain)
+    b = normalize_captain(wanted)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
 
 
 def resolve_teams_from_standings(
     rows: list[StandingsRow],
     *,
     use_captain: bool,
-    captain_name: str,
+    captain_names: list[str],
     config_team_name: str,
-) -> tuple[list[StandingsRow], Literal["captain", "teamName"]]:
+) -> tuple[list[StandingsRow], Literal["captain", "teamName"], list[dict[str, Any]]]:
     """
     Pick which standings rows we scrape games for.
 
-    Returns (matched_rows, resolution_mode) where resolution_mode is
-    "captain" or "teamName".
+    Returns (matched_rows, resolution_mode, captain_match_details).
+    captain_match_details lists each query and the teams it matched (may be empty).
     """
     if use_captain:
-        # Prefer captain discovery whenever captainName is non-empty.
-        matched = [r for r in rows if captain_matches(r.captain_name, captain_name)]
+        captain_match_details: list[dict[str, Any]] = []
+        for query in captain_names:
+            hits = [r for r in rows if captain_matches(r.captain_name, query)]
+            captain_match_details.append({"query": query, "matchedTeams": hits})
+
+        # Deduplicate teams matched by any query.
+        seen: set[str] = set()
+        matched: list[StandingsRow] = []
+        for detail in captain_match_details:
+            for row in detail["matchedTeams"]:
+                key = row.team_name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    matched.append(row)
+
         if not matched:
             captains = ", ".join(r.captain_name for r in rows if r.captain_name) or "(none extracted)"
+            wanted = ", ".join(json.dumps(n) for n in captain_names)
             raise ResolveError(
-                f'No standings row matched captainName="{captain_name}". '
+                f"No standings row matched captainName=[{wanted}]. "
                 f"Captains seen: {captains}."
             )
-        return matched, "captain"
+        return matched, "captain", captain_match_details
 
     # Explicit teamName path (captainName empty / omitted).
     wanted = config_team_name.lower()
@@ -392,8 +435,8 @@ def resolve_teams_from_standings(
                 f'No standings row matched teamName="{config_team_name}". '
                 f"Teams seen: {names}."
             )
-        return partial, "teamName"
-    return matched, "teamName"
+        return partial, "teamName", []
+    return matched, "teamName", []
 
 
 # ---------------------------------------------------------------------------
@@ -717,10 +760,10 @@ async def scrape() -> dict[str, Any]:
     load_dotenv_files()
     config = load_config()
 
-    # Normalize the discovery knobs once (strip whitespace like the TS version).
-    captain_name = config.captain_name.strip()
+    # Normalize the discovery knobs once (captain_name is already a list[str]).
+    captain_names = list(config.captain_name)
     config_team_name = config.team_name.strip()
-    use_captain = len(captain_name) > 0
+    use_captain = len(captain_names) > 0
 
     # Strip trailing slashes so suffix join is predictable.
     league_url = config.league_url.rstrip("/")
@@ -736,7 +779,7 @@ async def scrape() -> dict[str, Any]:
             if config_team_name
             else ""
         )
-        log(f'Config: captain="{captain_name}"{ignored} day="{config.day}" league="{config.league}"')
+        log(f'Config: captains={json.dumps(captain_names)}{ignored} day="{config.day}" league="{config.league}"')
     else:
         log(f'Config: team="{config_team_name}" day="{config.day}" league="{config.league}"')
     log(f"Standings URL: {league_url}")
@@ -775,10 +818,10 @@ async def scrape() -> dict[str, Any]:
             )
             standings = standings_result.data
 
-            matched_teams, resolution = resolve_teams_from_standings(
+            matched_teams, resolution, captain_match_details = resolve_teams_from_standings(
                 standings.rows or [],
                 use_captain=use_captain,
-                captain_name=captain_name,
+                captain_names=captain_names,
                 config_team_name=config_team_name,
             )
             team_names = [t.team_name for t in matched_teams]
@@ -791,6 +834,19 @@ async def scrape() -> dict[str, Any]:
                     for t in matched_teams
                 )
             )
+            for detail in captain_match_details:
+                hits = detail["matchedTeams"]
+                q = json.dumps(detail["query"])
+                if not hits:
+                    log(f"  captain query {q}: no team matched")
+                else:
+                    log(
+                        f"  captain query {q}: "
+                        + ", ".join(
+                            f'"{t.team_name}" (captain={t.captain_name or "?"})'
+                            for t in hits
+                        )
+                    )
 
             # ---------------------------------------------------------------
             # 2) Schedule: select + verify each week tab, extract() games.
@@ -850,7 +906,30 @@ async def scrape() -> dict[str, Any]:
             # 3) Build output payload (shape matches the TypeScript scraper).
             # ---------------------------------------------------------------
             output: dict[str, Any] = {
-                "captainSearched": captain_name if use_captain else None,
+                "captainSearched": (
+                    (captain_names[0] if len(captain_names) == 1 else captain_names)
+                    if use_captain
+                    else None
+                ),
+                "captainMatchDetails": (
+                    [
+                        {
+                            "query": d["query"],
+                            "matchedTeams": [
+                                {
+                                    "teamName": t.team_name,
+                                    "captainName": t.captain_name,
+                                    "record": t.record,
+                                    "standing": t.standing,
+                                }
+                                for t in d["matchedTeams"]
+                            ],
+                        }
+                        for d in captain_match_details
+                    ]
+                    if use_captain
+                    else None
+                ),
                 "resolution": resolution,
                 "matchedTeams": [
                     {
