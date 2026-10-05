@@ -14,7 +14,7 @@ Same flow as TypeScript:
 
 ## Requirements
 
-- Python 3.10+ (3.11/3.12/3.13 fine)
+- Python 3.11+ (required by the `stagehand` package; 3.12/3.13 fine)
 - Google Chrome installed (local mode)
 - `OPENAI_API_KEY` (local mode) **or** `BROWSERBASE_API_KEY`
 
@@ -31,7 +31,7 @@ export OPENAI_API_KEY=...          # if not using .env
 python main.py
 ```
 
-`main.py` loads `../.env` then `python/.env` (shell exports win). Do not commit `.env` or `.venv`.
+`main.py` reads both `python/.env` and the repo-root `../.env`. Precedence, highest first: **shell exports > `python/.env` > `../.env`**. A value in `python/.env` overrides the same key in the root `.env`, and a variable you `export` in the shell overrides both. Do not commit `.env` or `.venv`.
 
 ## Config
 
