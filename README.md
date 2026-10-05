@@ -139,3 +139,8 @@ Type-check only: `pnpm typecheck`.
 ```
 
 When resolving by captain, `captainSearched` is the config string you searched for and `matchedTeams` lists every standings row that matched. When using `teamName` only, `captainSearched` is `null` and `resolution` is `"teamName"`.
+
+## Python version
+
+A thoroughly commented Python port lives in [`python/`](./python/), using the Stagehand Python SDK (`pip install stagehand`) with the same act / extract / observe flow and the same shared `config.json`. See [`python/README.md`](./python/README.md).
+
