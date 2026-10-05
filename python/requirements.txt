@@ -1,0 +1,10 @@
+# Stagehand v4 Python SDK (act / extract / observe + local Chrome / Browserbase).
+# Pin to the same major as the TypeScript package (@browserbasehq/stagehand ^4.1.0).
+stagehand==4.1.0
+
+# Pydantic is pulled in by stagehand; listed explicitly because our schemas use it.
+pydantic>=2.0,<3
+
+# Optional: load ../.env and python/.env automatically. main.py also has a
+# tiny manual .env parser if this isn't installed.
+python-dotenv>=1.0,<2
