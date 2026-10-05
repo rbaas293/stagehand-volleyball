@@ -33,6 +33,7 @@ Edit **`config.yaml`** to change the captain, team, day, league label, or divisi
 | `day` | yes | Game day label (e.g. `"Sunday"`) — stored in output for convenience |
 | `league` | yes | Human-readable league / division path for your own notes |
 | `leagueUrl` | yes | Division standings URL (the script appends the schedule suffix) |
+| `model` | no | xAI Grok model id (default `grok-4-fast-reasoning`). Overridden by `STAGEHAND_MODEL`. |
 | `schedulePathSuffix` | no | Default `"/schedule"` |
 
 You must set **at least one** of `captainName` or `teamName`.
@@ -74,18 +75,20 @@ If a captain captains more than one team in the division, every matching team is
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | yes (local mode) | LLM used by `extract()`. Stagehand never reads env vars itself; `index.ts` reads this one and passes it to `Stagehand.create()`. |
-| `BROWSERBASE_API_KEY` | optional | Uses `browserbase.launch()` (a cloud browser) instead of local Chrome. If `OPENAI_API_KEY` isn't set, Browserbase's Model Gateway picks the model. |
-| `STAGEHAND_MODEL` | optional | Overrides the model. Default: `openai/gpt-5.6-luna`. |
+| `XAI_API_KEY` | yes (local mode) | xAI key for Grok. Stagehand v4 has no native xAI provider, so `index.ts` calls Grok through a BYO LLM callback (OpenAI-compatible client at `https://api.x.ai/v1`). |
+| `BROWSERBASE_API_KEY` | optional | Uses `browserbase.launch()` (a cloud browser) instead of local Chrome. If `XAI_API_KEY` isn't set, Browserbase's Model Gateway picks the model. |
+| `STAGEHAND_MODEL` | optional | Overrides `config.yaml` `model`. Default: `grok-4-fast-reasoning`. |
 | `HEADLESS` | optional | Set to `false` to watch the Chrome window. |
 
 Set these in your shell, or copy `.env.example` to `.env` (it's git-ignored) and use `pnpm scrape:env`. Don't commit keys.
+
+The Stagehand LLM model itself is also configurable in **`config.yaml`** via the `model` field (default `grok-4-fast-reasoning`, which supports structured outputs and tool use on xAI).
 
 ## Run
 
 ```bash
 pnpm install
-export OPENAI_API_KEY=...   # or: cp .env.example .env and fill it in
+export XAI_API_KEY=...   # or: cp .env.example .env and fill it in
 pnpm scrape                 # or: pnpm scrape:env  (loads .env)
 ```
 

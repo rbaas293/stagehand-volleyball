@@ -16,7 +16,7 @@ Same flow as TypeScript:
 
 - Python 3.11+ (required by the `stagehand` package; 3.12/3.13 fine)
 - Google Chrome installed (local mode)
-- `OPENAI_API_KEY` (local mode) **or** `BROWSERBASE_API_KEY`
+- `XAI_API_KEY` (local mode) **or** `BROWSERBASE_API_KEY`
 
 ## Setup
 
@@ -27,7 +27,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env               # or reuse the repo-root .env
 # edit ../config.yaml (shared) — captainName / teamName / day / league / leagueUrl
-export OPENAI_API_KEY=...          # if not using .env
+export XAI_API_KEY=...             # if not using .env
 python main.py
 ```
 
@@ -44,15 +44,16 @@ Uses the same fields as the TypeScript scraper — see the root [README](../READ
 | `day` | yes | Stored in output |
 | `league` | yes | Human label |
 | `leagueUrl` | yes | Division standings URL |
+| `model` | no | xAI Grok model id (default `grok-4-fast-reasoning`). Overridden by `STAGEHAND_MODEL`. |
 | `schedulePathSuffix` | no | Default `"/schedule"` |
 
 ## Environment
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | yes (local) | Passed to `Stagehand.create(model_api_key=...)` |
+| `XAI_API_KEY` | yes (local) | xAI key; `main.py` calls Grok via a Stagehand BYO LLM callback (OpenAI-compatible client at `https://api.x.ai/v1`) |
 | `BROWSERBASE_API_KEY` | optional | `browserbase.launch()` instead of local Chrome |
-| `STAGEHAND_MODEL` | optional | Default `openai/gpt-5.6-luna` |
+| `STAGEHAND_MODEL` | optional | Overrides `config.yaml` `model`. Default `grok-4-fast-reasoning` |
 | `HEADLESS` | optional | Set `false` to show Chrome |
 
 ## Output

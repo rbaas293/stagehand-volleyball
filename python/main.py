@@ -13,13 +13,13 @@ This mirrors the TypeScript scraper in ../index.ts:
 Run (from this folder):
   python3 -m venv .venv && source .venv/bin/activate
   pip install -r requirements.txt
-  export OPENAI_API_KEY=...   # or put it in ../.env / .env
+  export XAI_API_KEY=...   # or put it in ../.env / .env
   python main.py
 
 Env:
-  OPENAI_API_KEY       required for local-Chrome mode
+  XAI_API_KEY          required for local-Chrome mode (Grok via BYO LLM callback)
   BROWSERBASE_API_KEY  optional: run in a Browserbase cloud browser instead
-  STAGEHAND_MODEL      optional, default "openai/gpt-5.6-luna"
+  STAGEHAND_MODEL      optional, overrides config.yaml model (default "grok-4-fast-reasoning")
   HEADLESS=false       optional: show the local Chrome window
 
 Config resolution (same as TypeScript):
@@ -38,7 +38,7 @@ from __future__ import annotations
 # ---- Standard library -------------------------------------------------------
 import asyncio          # Stagehand's Python API is async; we drive it with asyncio.run()
 import json             # Serialize games.json (and the team-name list passed to the page)
-import os               # Read env vars (OPENAI_API_KEY, HEADLESS, …)
+import os               # Read env vars (XAI_API_KEY, HEADLESS, …)
 import re               # Match week-tab labels (Week / TOURNAMENT / …)
 import sys              # Exit codes + stderr logging
 from urllib.parse import urlparse        # Validate leagueUrl is a real http(s) URL
@@ -48,8 +48,9 @@ from typing import Any, Literal          # Typing for status enum + loose YAML/J
 
 # ---- Third-party ------------------------------------------------------------
 import yaml  # PyYAML: parse config.yaml (safe_load only — plain data, never arbitrary objects)
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
-from stagehand import Stagehand, browserbase, local_browser
+from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local_browser
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -75,7 +76,7 @@ class ConfigError(Exception):
 
 
 class MissingKeyError(Exception):
-    """Raised when neither OPENAI_API_KEY nor BROWSERBASE_API_KEY is available."""
+    """Raised when neither XAI_API_KEY nor BROWSERBASE_API_KEY is available."""
 
 
 class ResolveError(Exception):
@@ -126,6 +127,9 @@ class AppConfig(BaseModel):
     league_url: str = Field(min_length=1, alias="leagueUrl")
     # Path appended to leagueUrl to reach the schedule tab (default "/schedule").
     schedule_path_suffix: str = Field(default="/schedule", alias="schedulePathSuffix")
+    # xAI Grok model id (api.x.ai). Stagehand v4 has no native xAI provider;
+    # we call Grok through a BYO LLM callback (OpenAI-compatible client).
+    model: str = Field(default="grok-4-fast-reasoning", min_length=1)
 
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
@@ -400,24 +404,104 @@ def log(msg: str) -> None:
     print(f"[stagehand-volleyball] {msg}", file=sys.stderr)
 
 
-def model_kwargs() -> dict[str, Any]:
+DEFAULT_GROK_MODEL = "grok-4-fast-reasoning"
+XAI_BASE_URL = "https://api.x.ai/v1"
+
+
+def resolve_grok_model_id(config_model: str | None = None) -> str:
+    """
+    Resolve the Grok model id: STAGEHAND_MODEL > config.model > default.
+
+    Accepts an optional "xai/" provider prefix (from older Stagehand docs) and
+    strips it before calling api.x.ai, which wants the bare model id.
+    """
+    raw = (os.environ.get("STAGEHAND_MODEL") or "").strip() or (
+        (config_model or "").strip() or DEFAULT_GROK_MODEL
+    )
+    if raw.lower().startswith("xai/"):
+        return raw[4:]
+    return raw
+
+
+def make_grok_generate(api_key: str, model_id: str):
+    """
+    Build a Stagehand BYO LLM callback that calls xAI Grok.
+
+    Stagehand v4 first-class providers are only openai/anthropic/google/groq/
+    cerebras. xAI is reached via the documented OpenAI-compatible BYO callback
+    pointed at https://api.x.ai/v1 (XAI_API_KEY). See Stagehand v4 models docs
+    ("bring your own LLM" / "OpenAI-compatible SDKs") and docs.x.ai.
+    """
+    client = AsyncOpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+
+    def content_part(block: Any) -> dict[str, Any]:
+        # Each block is LLMTextContent or LLMImageContent under `.root`.
+        root = getattr(block, "root", block)
+        if getattr(root, "type", None) == "text":
+            return {"type": "input_text", "text": root.text}
+        return {
+            "type": "input_image",
+            "image_url": f"data:{root.mime_type};base64,{root.data}",
+            "detail": "auto",
+        }
+
+    def message_content(message: Any) -> list[dict[str, Any]]:
+        content = message.content
+        blocks = content if isinstance(content, list) else [content]
+        return [content_part(block) for block in blocks]
+
+    async def generate_with_grok(params: Any) -> Any:
+        response_format = params.response_format
+        # Stagehand act/extract/observe issue structured (json_schema) generations.
+        schema = response_format.schema_
+        schema_payload = schema.model_dump() if hasattr(schema, "model_dump") else schema
+        response = await client.responses.create(
+            model=model_id,
+            instructions=params.system_prompt,
+            input=[
+                {"role": message.role.value, "content": message_content(message)}
+                for message in params.messages
+            ],
+            temperature=params.temperature,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": response_format.name,
+                    "schema": schema_payload,
+                    "strict": True,
+                }
+            },
+        )
+        return LLMStructuredGenerateResult.model_validate(
+            {
+                "role": "assistant",
+                "content": {"type": "text", "text": response.output_text},
+                "output_format": "json_schema",
+                "structured_content": json.loads(response.output_text),
+            }
+        )
+
+    return generate_with_grok
+
+
+def model_kwargs(config_model: str | None = None) -> dict[str, Any]:
     """
     Build Stagehand.create() kwargs for the LLM.
 
-    Stagehand never reads env vars itself — we pass the key explicitly.
-    Local Chrome needs OPENAI_API_KEY; Browserbase can use its Model Gateway
-    when OPENAI_API_KEY is absent.
+    Local Chrome needs XAI_API_KEY (Grok BYO callback). Browserbase can use its
+    Model Gateway when XAI_API_KEY is absent.
     """
-    model_name = os.environ.get("STAGEHAND_MODEL", "openai/gpt-5.6-luna")
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = (os.environ.get("XAI_API_KEY") or "").strip()
     if api_key:
-        # model= is the model id string; model_api_key authenticates the provider.
-        return {"model": model_name, "model_api_key": api_key}
+        model_id = resolve_grok_model_id(config_model)
+        log(f'LLM: xAI Grok model="{model_id}" via {XAI_BASE_URL}')
+        # Pass the generate callback as `model=` (Stagehand BYO LLM path).
+        return {"model": make_grok_generate(api_key, model_id)}
     if os.environ.get("BROWSERBASE_API_KEY"):
         # Omit model — Browserbase Model Gateway picks one.
         return {}
     raise MissingKeyError(
-        "OPENAI_API_KEY is not set. Export it, or put it in .env "
+        "XAI_API_KEY is not set. Export it, or put it in .env "
         "(repo root or python/). Alternatively set BROWSERBASE_API_KEY to use a "
         "Browserbase cloud browser + Model Gateway."
     )
@@ -660,7 +744,7 @@ async def scrape() -> dict[str, Any]:
     log(f"Config path:   {CONFIG_PATH}")
 
     # Fail fast on missing API key *before* launching Chrome.
-    create_kwargs = model_kwargs()
+    create_kwargs = model_kwargs(config.model)
 
     browser = await launch_browser()
     try:

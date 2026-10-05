@@ -23,5 +23,11 @@ league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer
 # leagueUrl + schedulePathSuffix.
 leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
 
+# xAI Grok model id for Stagehand extract/act (OpenAI-compatible API at api.x.ai).
+# Stagehand v4 has no native xAI provider, so both scrapers call Grok via a BYO
+# LLM callback. Override with env STAGEHAND_MODEL. Default supports structured
+# outputs + tool use (see https://docs.x.ai/docs/models).
+model: "grok-4-fast-reasoning"
+
 # Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
 schedulePathSuffix: "/schedule"

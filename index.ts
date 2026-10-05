@@ -2,9 +2,9 @@
  * Stagehand v4 scraper: volleyball game times for a team (or captain) on league.ninja.
  *
  * Run:  pnpm install && pnpm scrape
- * Env:  OPENAI_API_KEY      required for the default local-Chrome mode
+ * Env:  XAI_API_KEY         required for the default local-Chrome mode (Grok)
  *       BROWSERBASE_API_KEY optional: run in a Browserbase cloud browser instead
- *       STAGEHAND_MODEL     optional, default "openai/gpt-5.6-luna"
+ *       STAGEHAND_MODEL     optional, overrides config.yaml model (default "grok-4-fast-reasoning")
  *       HEADLESS=false      optional: show the local Chrome window
  *
  * Target captain / team / day / league / URL come from config.yaml (see config.example.yaml).
@@ -31,9 +31,9 @@ import {
   browserbase,
   localBrowser,
   Stagehand,
-  type ModelName,
   type StagehandBrowser,
 } from "@browserbasehq/stagehand";
+import OpenAI from "openai";
 import { z } from "zod/v4";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +47,9 @@ const ConfigSchema = z
     day: z.string().min(1),
     league: z.string().min(1),
     leagueUrl: z.string().url(),
+    // xAI Grok model id (api.x.ai). Stagehand v4 has no native xAI provider;
+    // we call Grok through a BYO LLM callback (OpenAI-compatible client).
+    model: z.string().min(1).optional().default("grok-4-fast-reasoning"),
     schedulePathSuffix: z.string().optional().default("/schedule"),
   })
   .superRefine((val, ctx) => {
@@ -89,7 +92,7 @@ function loadConfig(): AppConfig {
       .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
       .join("; ");
     throw new ConfigError(
-      `config.yaml is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional schedulePathSuffix).`,
+      `config.yaml is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional model, schedulePathSuffix).`,
     );
   }
   return result.data;
@@ -106,9 +109,17 @@ const CONFIG_TEAM_NAME = config.teamName?.trim() ?? "";
 const USE_CAPTAIN = CAPTAIN_NAME.length > 0;
 const LEAGUE_URL = config.leagueUrl.replace(/\/+$/, "");
 const SCHEDULE_URL = `${LEAGUE_URL}${config.schedulePathSuffix.startsWith("/") ? config.schedulePathSuffix : `/${config.schedulePathSuffix}`}`;
-const MODEL_NAME = (process.env.STAGEHAND_MODEL ?? "openai/gpt-5.6-luna") as ModelName;
+/** Default xAI Grok id (structured outputs + tool use). Override via config.model or STAGEHAND_MODEL. */
+const DEFAULT_GROK_MODEL = "grok-4-fast-reasoning";
+const XAI_BASE_URL = "https://api.x.ai/v1";
 const HEADLESS = process.env.HEADLESS !== "false";
 const OUTPUT_PATH = join(ROOT, "games.json");
+
+/** Resolve the Grok model id: STAGEHAND_MODEL > config.model > default. Strip optional "xai/" prefix. */
+function resolveGrokModelId(): string {
+  const raw = (process.env.STAGEHAND_MODEL?.trim() || config.model?.trim() || DEFAULT_GROK_MODEL);
+  return raw.toLowerCase().startsWith("xai/") ? raw.slice(4) : raw;
+}
 
 // ---- Schemas ---------------------------------------------------------------
 const GameSchema = z.object({
@@ -196,12 +207,91 @@ function resolveTeamsFromStandings(
 }
 
 // ---- Setup helpers ---------------------------------------------------------
-function modelConfig() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (apiKey) return { modelName: MODEL_NAME, apiKey };
-  if (process.env.BROWSERBASE_API_KEY) return undefined; // Browserbase Model Gateway picks a model
+/**
+ * Stagehand v4 first-class providers are only openai/anthropic/google/groq/cerebras.
+ * xAI Grok is reached via the documented BYO LLM callback + OpenAI-compatible
+ * client pointed at https://api.x.ai/v1 (XAI_API_KEY). See:
+ * https://docs.stagehand.dev/v4/configuration/models (bring your own LLM /
+ * OpenAI-compatible SDKs) and https://docs.x.ai/docs/models.
+ *
+ * Params are typed loosely: the TS SDK does not re-export LLMGenerateParams, and
+ * the ClientLLM Zod schema includes tool_use blocks we don't need to model here.
+ */
+type GrokContentBlock = {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+};
+
+function messageContent(content: GrokContentBlock | GrokContentBlock[]) {
+  const blocks = Array.isArray(content) ? content : [content];
+  return blocks.map((block) => {
+    if (block.type === "text") {
+      return { type: "input_text" as const, text: block.text ?? "" };
+    }
+    if (block.type === "image") {
+      return {
+        type: "input_image" as const,
+        image_url: `data:${block.mimeType};base64,${block.data}`,
+        detail: "auto" as const,
+      };
+    }
+    // Ignore tool_use / tool_result blocks for structured extract/act calls.
+    return { type: "input_text" as const, text: "" };
+  });
+}
+
+function makeGrokGenerate(apiKey: string, modelId: string) {
+  const client = new OpenAI({ apiKey, baseURL: XAI_BASE_URL });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return async function generateWithGrok(params: any) {
+    if (params.responseFormat?.type !== "json_schema") {
+      throw new TypeError("Stagehand only issues structured generations");
+    }
+    const response = await client.responses.create({
+      model: modelId,
+      instructions: params.systemPrompt,
+      input: params.messages.map(
+        (message: { role: "user" | "assistant"; content: GrokContentBlock | GrokContentBlock[] }) => ({
+          role: message.role,
+          content: messageContent(message.content),
+        }),
+      ),
+      temperature: params.temperature,
+      text: {
+        format: {
+          type: "json_schema",
+          name: params.responseFormat.name,
+          schema: params.responseFormat.schema as Record<string, unknown>,
+          strict: true,
+        },
+      },
+    });
+    return {
+      role: "assistant" as const,
+      content: { type: "text" as const, text: response.output_text },
+      outputFormat: "json_schema" as const,
+      structuredContent: JSON.parse(response.output_text),
+    };
+  };
+}
+
+/** Build Stagehand.create({ model }) — Grok BYO callback, or Gateway when only BB key is set. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function modelConfig(): { generate: (params: any) => Promise<any> } | undefined {
+  const apiKey = process.env.XAI_API_KEY?.trim();
+  if (apiKey) {
+    const modelId = resolveGrokModelId();
+    log(`LLM: xAI Grok model="${modelId}" via ${XAI_BASE_URL}`);
+    return { generate: makeGrokGenerate(apiKey, modelId) };
+  }
+  if (process.env.BROWSERBASE_API_KEY) {
+    // Omit model — Browserbase Model Gateway picks one.
+    return undefined;
+  }
   throw new MissingKeyError(
-    "OPENAI_API_KEY is not set. Export it, or put it in .env and run `pnpm scrape:env`. " +
+    "XAI_API_KEY is not set. Export it, or put it in .env and run `pnpm scrape:env`. " +
       "Alternatively set BROWSERBASE_API_KEY to use a Browserbase cloud browser + Model Gateway.",
   );
 }
