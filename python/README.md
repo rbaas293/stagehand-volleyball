@@ -58,3 +58,23 @@ Uses the same fields as the TypeScript scraper — see the root [README](../READ
 ## Output
 
 Same shape as the TypeScript `games.json` (see root README). Written to **`python/games.json`** so it does not overwrite the TS output at the repo root.
+
+## Packaging (wheels / shiv)
+
+`pyproject.toml` packages `main.py` as an installable module with console script
+`stagehand-volleyball` (`main:main`). Dependencies stay in sync with
+`requirements.txt`.
+
+```bash
+cd python
+pip install -e ".[dev]"          # editable + ruff/pytest/build/shiv
+python -m build                  # wheels + sdist under dist/
+shiv -c stagehand-volleyball -o dist/shiv/stagehand-volleyball.pyz .
+pytest -q                        # smoke: import + config load
+```
+
+GitHub Actions (`.github/workflows/python-ci.yml`) gates on scraper PR #1 being
+merged, then runs checks (3.11/3.12), wheel builds, and shiv binaries. Use
+`workflow_dispatch` with `skip_gate=true` only to verify those jobs before #1
+merges.
+

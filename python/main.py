@@ -53,17 +53,53 @@ from stagehand import Stagehand, browserbase, local_browser
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# Directory that contains this script (python/).
+# Directory that contains this module. When you run `python main.py` from
+# python/, this is the source tree. When installed as a wheel / shiv .pyz,
+# this is inside site-packages (or the zipapp), so we also probe cwd below.
 ROOT = Path(__file__).resolve().parent
 
-# Prefer the shared repo-root config so one config.json drives both TS and Python.
-# Fall back to python/config.json if someone wants a Python-only override.
+# True when we are sitting in the repo's python/ tree (editable or direct run),
+# not inside an installed wheel/shiv. Used to pick a sensible games.json path.
+_RUNNING_FROM_SOURCE = (ROOT / "pyproject.toml").is_file() or (
+    ROOT / "requirements.txt"
+).is_file()
+
+
+def _resolve_config_path() -> Path:
+    """
+    Pick which config.json to load without changing the JSON schema.
+
+    Order (first existing file wins):
+      1. Repo-root ../config.json relative to this file (shared TS + Python).
+      2. python/config.json next to this file (optional Python-only override).
+      3. ./config.json in the process cwd (shiv / console-script from repo root).
+      4. ../config.json from cwd (shiv launched from python/).
+
+    If none exist, return the preferred parent path so error messages still
+    point at the shared repo-root location.
+    """
+    candidates = [
+        ROOT.parent / "config.json",
+        ROOT / "config.json",
+        Path.cwd() / "config.json",
+        Path.cwd().parent / "config.json",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
 PARENT_CONFIG = ROOT.parent / "config.json"
 LOCAL_CONFIG = ROOT / "config.json"
-CONFIG_PATH = PARENT_CONFIG if PARENT_CONFIG.is_file() else LOCAL_CONFIG
+# Snapshot at import for logging / tests; load_config() re-resolves each call
+# so a packaged binary started from a different cwd still finds config.json.
+CONFIG_PATH = _resolve_config_path()
 
-# Output lands next to this script so TS games.json and Python games.json don't clash.
-OUTPUT_PATH = ROOT / "games.json"
+# Source checkout: write beside this script (python/games.json) so we do not
+# clobber the TypeScript games.json at the repo root. Packaged/shiv runs:
+# write ./games.json in the caller's cwd instead (site-packages is read-only).
+OUTPUT_PATH = (ROOT / "games.json") if _RUNNING_FROM_SOURCE else (Path.cwd() / "games.json")
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +180,7 @@ class AppConfig(BaseModel):
         return stripped
 
     @model_validator(mode="after")
-    def require_captain_or_team(self) -> "AppConfig":
+    def require_captain_or_team(self) -> AppConfig:
         """Same rule as the TS superRefine: at least one of captain/team must be set."""
         has_captain = bool(self.captain_name.strip())
         has_team = bool(self.team_name.strip())
@@ -199,11 +235,13 @@ def load_dotenv_files() -> None:
 
 def load_config() -> AppConfig:
     """Read and validate config.json (parent preferred, then python/config.json)."""
+    # Re-resolve on every call so shiv/console-script cwd is honored.
+    config_path = _resolve_config_path()
     try:
-        raw = CONFIG_PATH.read_text(encoding="utf-8")
+        raw = config_path.read_text(encoding="utf-8")
     except OSError as err:
         raise ConfigError(
-            f"Missing or unreadable config.json at {CONFIG_PATH} ({err}). "
+            f"Missing or unreadable config.json at {config_path} ({err}). "
             "Copy config.example.json to config.json at the repo root and edit "
             "captainName and/or teamName, day, league, and leagueUrl."
         ) from err

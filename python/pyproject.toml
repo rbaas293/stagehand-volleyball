@@ -1,0 +1,59 @@
+# Packaging for the Python Stagehand volleyball scraper.
+# Builds wheels (python -m build) and supports shiv console-script binaries.
+# Install from this directory: pip install -e ".[dev]"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stagehand-volleyball"
+version = "0.1.0"
+description = "Stagehand v4 Python scraper for league.ninja volleyball schedules"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Ryan Baas" }]
+dependencies = [
+    # Keep in sync with requirements.txt (pip -r still works for non-packaged runs).
+    "stagehand==4.1.0",
+    "pydantic>=2.0,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+# CI / local verification: lint, tests, wheel build, shiv binaries.
+dev = [
+    "ruff>=0.6",
+    "pytest>=8",
+    "build>=1.2",
+    "shiv>=1.0",
+]
+
+[project.scripts]
+# One console script per scraper entrypoint. Today that is just main:main;
+# add another line here if you add another runnable script under python/.
+stagehand-volleyball = "main:main"
+
+[tool.setuptools]
+# Flat layout: keep main.py importable as `import main` (no package rename).
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["."]
+
+[tool.ruff.lint]
+# Match the thorough-comment style of main.py: keep unused imports noisy, but
+# don't fight pydantic / stagehand typing patterns.
+select = ["E", "F", "I", "W", "UP"]
+ignore = [
+    "E501",  # line length: long comment lines are intentional in this codebase
+    "I001",  # isort: keep hand-aligned import comments in main.py
+    "UP017", # datetime.UTC needs 3.11+; we still support 3.10 via timezone.utc
+]
