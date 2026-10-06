@@ -41,7 +41,7 @@ stagehand-volleyball = "main:main"
 
 [tool.setuptools]
 # Flat layout: keep modules importable as `import main` / lean_api / token_usage.
-py-modules = ["main", "lean_api", "token_usage"]
+py-modules = ["main", "lean_api", "lean_http", "token_usage"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

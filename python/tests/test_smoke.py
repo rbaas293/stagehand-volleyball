@@ -24,13 +24,16 @@ EXAMPLE_CONFIG = REPO_ROOT / "config.example.yaml"
 def test_main_module_imports() -> None:
     """Console-script target `main:main` must be importable after install."""
     import lean_api
+    import lean_http
     import main
     import token_usage
 
     assert callable(main.main)
     assert callable(main.load_config)
     assert hasattr(main, "AppConfig")
-    assert hasattr(lean_api, "_http_get_json")
+    # lean_http owns the client; lean_api re-exports http_get_json.
+    assert hasattr(lean_http, "http_get_json")
+    assert hasattr(lean_api, "http_get_json")
     assert hasattr(token_usage, "USAGE")
 
 

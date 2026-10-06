@@ -12,15 +12,21 @@ https://flan1-lms-pub-api.league.ninja with endpoints:
 
 from __future__ import annotations
 
-import http.client
-import json
-import time
-import urllib.error
-import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
+
+from lean_http import (
+    CircuitOpenError,
+    CircuitTrippedError,
+    HttpSettings,
+    LeanApiError,
+    configure_http,
+    get_client,
+    http_get_json,
+)
 
 # Match result codes from ninScripts MatchResult enum.
 _RESULT_HOME_PLAY = 10
@@ -36,14 +42,19 @@ _API_BY_SITE_HOST = {
     "flannagans.league.ninja": "https://flan1-lms-pub-api.league.ninja",
 }
 
-# Default HTTP policy for lean mode.
-_DEFAULT_TIMEOUT_S = 20.0
-_DEFAULT_RETRIES = 3
-_DEFAULT_BACKOFF_S = 0.5
 
+# Re-export for callers / tests.
+__all__ = [
+    "CircuitOpenError",
+    "CircuitTrippedError",
+    "HttpSettings",
+    "LeanApiError",
+    "StandingsProbeError",
+    "configure_http",
+    "get_client",
+    "http_get_json",
+]
 
-class LeanApiError(Exception):
-    """HTTP / shape errors from the pub API."""
 
 
 def infer_api_base(*, api_base_url: str | None, site_url: str | None, league_url: str | None) -> str:
@@ -69,103 +80,8 @@ def division_url(site_url: str, div_uid: str) -> str:
     return f"{origin}/leagues/division/{div_uid}"
 
 
-def _http_get_json(
-    url: str,
-    *,
-    timeout: float = _DEFAULT_TIMEOUT_S,
-    retries: int = _DEFAULT_RETRIES,
-    backoff_s: float = _DEFAULT_BACKOFF_S,
-) -> Any:
-    """
-    GET JSON with timeout, retries/backoff on transient failures, and clear errors.
-
-    Retries on URLError / timeouts / HTTP 5xx / 429 / http.client.HTTPException /
-    OSError (covers RemoteDisconnected, IncompleteRead, BadStatusLine,
-    ConnectionResetError). Non-retryable 4xx raise immediately as LeanApiError.
-    """
-    last_err: BaseException | None = None
-    attempts = max(1, retries)
-
-    def _backoff(attempt: int) -> None:
-        time.sleep(backoff_s * (2 ** (attempt - 1)))
-
-    for attempt in range(1, attempts + 1):
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                # urllib raises HTTPError for non-2xx; still guard status.
-                status = getattr(resp, "status", None) or resp.getcode()
-                if status is not None and int(status) >= 400:
-                    raise urllib.error.HTTPError(
-                        url, int(status), f"HTTP {status}", resp.headers, None
-                    )
-                body = resp.read().decode("utf-8")
-            try:
-                payload = json.loads(body)
-            except json.JSONDecodeError as err:
-                raise LeanApiError(f"Non-JSON response from {url}") from err
-            if isinstance(payload, dict) and "Data" in payload and "StatusCode" in payload:
-                code = payload.get("StatusCode")
-                if code not in (200, None) and payload.get("Data") is None:
-                    raise LeanApiError(
-                        f"API error for {url}: {payload.get('ErrorMessage') or code}"
-                    )
-                return payload["Data"]
-            return payload
-        except urllib.error.HTTPError as err:
-            # HTTPError is also an OSError/URLError — handle before those bases.
-            last_err = err
-            if err.code in (429, 500, 502, 503, 504) and attempt < attempts:
-                _backoff(attempt)
-                continue
-            raise LeanApiError(f"HTTP {err.code} for {url}: {err.reason or err}") from err
-        except urllib.error.URLError as err:
-            last_err = err
-            if attempt < attempts:
-                _backoff(attempt)
-                continue
-            raise LeanApiError(
-                f"Request failed for {url} after {attempts} attempt(s): {err}"
-            ) from err
-        except TimeoutError as err:
-            last_err = err
-            if attempt < attempts:
-                _backoff(attempt)
-                continue
-            raise LeanApiError(
-                f"Timed out fetching {url} after {attempts} attempt(s)"
-            ) from err
-        except http.client.HTTPException as err:
-            # RemoteDisconnected, IncompleteRead, BadStatusLine, etc.
-            last_err = err
-            if attempt < attempts:
-                _backoff(attempt)
-                continue
-            raise LeanApiError(
-                f"HTTP protocol error for {url} after {attempts} attempt(s): "
-                f"{type(err).__name__}: {err}"
-            ) from err
-        except OSError as err:
-            # ConnectionResetError and other socket-level failures.
-            last_err = err
-            if attempt < attempts:
-                _backoff(attempt)
-                continue
-            raise LeanApiError(
-                f"Connection error for {url} after {attempts} attempt(s): "
-                f"{type(err).__name__}: {err}"
-            ) from err
-    raise LeanApiError(f"Request failed for {url}: {last_err}")
-
-
 def list_seasons(api_base: str) -> list[dict[str, Any]]:
-    data = _http_get_json(f"{api_base}/nav/seasons/")
+    data = http_get_json(f"{api_base}/nav/seasons/")
     if not isinstance(data, list):
         raise LeanApiError("Unexpected /nav/seasons/ shape")
     return data
@@ -274,6 +190,63 @@ def pick_current_season(
     return ordered_season_candidates(seasons, now=now, season=season)[0]
 
 
+NOT_POSTED_YET = "not posted yet"
+
+
+class StandingsProbeError(LeanApiError):
+    """Standings probes failed (errors, not empty). Do not fall back or write games.json."""
+
+
+
+def _season_has_posted_data(
+    matched: list[dict[str, Any]],
+    *,
+    api_base: str,
+    probe_standings: Callable[[str, str], list[dict[str, Any]]] | None,
+    probe_limit: int = 8,
+) -> tuple[str, str]:
+    """
+    Classify whether a season has posted data for our levels.
+
+    Returns (status, detail) where status is:
+      - "posted": at least one probe returned teams (or no probing)
+      - "not_posted": matching divisions missing, or all probes returned empty standings
+      - "probe_failed": at least one probe raised LeanApiError and none returned teams
+        (must NOT fall back to another season)
+    """
+    if not matched:
+        return "not_posted", NOT_POSTED_YET
+    if probe_standings is None:
+        return "posted", "has matching divisions"
+    empty = 0
+    probed = 0
+    probe_errors = 0
+    last_err: str | None = None
+    for d in matched[: max(1, probe_limit)]:
+        uid = str(d.get("divisionUid") or "")
+        if not uid:
+            continue
+        probed += 1
+        try:
+            rows = probe_standings(api_base, uid)
+        except LeanApiError as err:
+            probe_errors += 1
+            last_err = str(err)
+            continue
+        if rows:
+            return "posted", "has teams in standings"
+        empty += 1
+    if probed == 0:
+        return "posted", "has matching divisions"
+    # Any probe error with no teams found → hard failure (never fall back).
+    if probe_errors > 0:
+        detail = last_err or "standings probe failed"
+        return "probe_failed", detail
+    if empty == probed:
+        return "not_posted", NOT_POSTED_YET
+    return "posted", "has matching divisions"
+
+
 def pick_season_for_levels(
     api_base: str,
     seasons: list[dict[str, Any]],
@@ -282,14 +255,16 @@ def pick_season_for_levels(
     now: datetime | None = None,
     season: str | None = None,
     list_divisions: Any = None,
+    probe_standings: Callable[[str, str], list[dict[str, Any]]] | None = None,
+    probe_limit: int = 8,
     log_fn: Any = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any]]:
     """
-    Pick a season that actually has divisions matching `levels`.
+    Pick a season that has posted data for `levels`.
 
-    Tries candidates from ordered_season_candidates. Among in-range seasons,
-    skips those with 0 level matches and falls back to the next in-range or most
-    recent season that has matches. Returns (season, matched_divisions, reason).
+    Skips seasons with no matching divisions, or (when probed) matching divisions
+    with no teams yet — logged as reason "not posted yet". Falls back to the next
+    candidate that has data. Returns (season, matched_divisions, reason, season_status).
 
     A config `season` override is tried alone (no auto-fallback to another season).
     """
@@ -297,50 +272,79 @@ def pick_season_for_levels(
     _log = log_fn or (lambda _msg: None)
     override = (season or "").strip()
     candidates = ordered_season_candidates(seasons, now=now, season=season)
-    tried: list[str] = []
+    skipped: list[dict[str, str]] = []
 
-    for idx, cand in enumerate(candidates):
+    for cand in candidates:
         uid = str(cand.get("uid") or "")
         name = str(cand.get("name") or uid)
         all_divs = list_divs(api_base, uid)
         matched = filter_divisions_by_levels(all_divs, levels)
-        tried.append(f"{name} ({len(matched)}/{len(all_divs)} level matches)")
-        if matched:
-            if override:
-                reason = f'config season override "{override}" → {name!r} ({uid})'
-            elif idx == 0:
-                reason = (
-                    f"active/in-range season {name!r} ({uid}) has "
-                    f"{len(matched)} division(s) matching levels={levels!r}"
+        status, detail = _season_has_posted_data(
+            matched,
+            api_base=api_base,
+            probe_standings=probe_standings,
+            probe_limit=probe_limit,
+        )
+        if status == "probe_failed":
+            raise StandingsProbeError(
+                f"Standings probe failed for season {name!r} ({uid}): {detail}. "
+                f"Not falling back to another season; refusing to overwrite games.json."
+            )
+        if status == "not_posted":
+            reason = NOT_POSTED_YET
+            if not matched:
+                _log(
+                    f"Season {name!r}: no divisions matching levels={levels!r} "
+                    f"— {NOT_POSTED_YET}; trying next"
                 )
             else:
-                skipped = ", ".join(tried[:-1]) or "(none)"
-                reason = (
-                    f"skipped season(s) with 0 level matches [{skipped}]; "
-                    f"using {name!r} ({uid}) with {len(matched)} match(es) "
-                    f"for levels={levels!r}"
+                _log(
+                    f"Season {name!r}: {len(matched)} level match(es) but no teams yet "
+                    f"— {NOT_POSTED_YET}; trying next"
                 )
-            _log(f"Season pick: {reason}")
-            return cand, matched, reason
+            skipped.append({"name": name, "uid": uid, "reason": reason})
+            if override:
+                break
+            continue
 
-    names = ", ".join(tried) or "(none)"
+        reason = (
+            f'config season override "{override}" → {name!r} ({uid})'
+            if override
+            else (
+                f"using {name!r} ({uid}): {detail}; "
+                f"{len(matched)} division(s) matching levels={levels!r}"
+            )
+        )
+        if skipped:
+            skipped_names = ", ".join(s["name"] for s in skipped)
+            reason += f"; skipped not-posted: [{skipped_names}]"
+        _log(f"Season pick: {reason}")
+        season_status = {
+            "picked": {"name": name, "uid": uid},
+            "skipped": skipped,
+        }
+        return cand, matched, reason, season_status
+
+    names = ", ".join(s["name"] for s in skipped) or "(none)"
     hint = (
         f' Set config season to a known good season name/uid (e.g. season: "Summer III- 2026"), '
         f"or adjust levels={levels!r}."
     )
+    season_status = {"picked": None, "skipped": skipped}
     if override:
         raise LeanApiError(
-            f'Config season="{override}" has 0 divisions matching levels={levels!r}. '
-            f"Tried: {names}.{hint}"
+            f'Config season="{override}" is {NOT_POSTED_YET} for levels={levels!r}. '
+            f"Skipped: {names}.{hint}"
         )
     raise LeanApiError(
-        f"No season has divisions matching levels={levels!r}. Tried: {names}.{hint}"
+        f"No season has posted data for levels={levels!r}. "
+        f"Skipped as {NOT_POSTED_YET}: {names}.{hint}"
     )
 
 
 def list_season_divisions(api_base: str, season_uid: str) -> list[dict[str, Any]]:
     # SPA uses axios get("nav/season/"+uid) — leading slash 404s on this host.
-    data = _http_get_json(f"{api_base}/nav/season/{season_uid}")
+    data = http_get_json(f"{api_base}/nav/season/{season_uid}")
     if not isinstance(data, list):
         raise LeanApiError("Unexpected nav/season shape")
     return data
@@ -368,21 +372,21 @@ def filter_divisions_by_levels(
 
 
 def get_standings(api_base: str, div_uid: str) -> list[dict[str, Any]]:
-    data = _http_get_json(f"{api_base}/divisions/{div_uid}/standings/")
+    data = http_get_json(f"{api_base}/divisions/{div_uid}/standings/")
     if not isinstance(data, list):
         raise LeanApiError(f"Unexpected standings shape for {div_uid}")
     return data
 
 
 def get_schedule_v2(api_base: str, div_uid: str) -> list[dict[str, Any]]:
-    data = _http_get_json(f"{api_base}/divisions/{div_uid}/schedule/v2/")
+    data = http_get_json(f"{api_base}/divisions/{div_uid}/schedule/v2/")
     if not isinstance(data, list):
         raise LeanApiError(f"Unexpected schedule shape for {div_uid}")
     return data
 
 
 def get_division(api_base: str, div_uid: str) -> dict[str, Any]:
-    data = _http_get_json(f"{api_base}/divisions/{div_uid}")
+    data = http_get_json(f"{api_base}/divisions/{div_uid}")
     if not isinstance(data, dict):
         raise LeanApiError(f"Unexpected division shape for {div_uid}")
     return data

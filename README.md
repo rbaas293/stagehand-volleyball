@@ -13,7 +13,7 @@ Default config searches captains **H. Robinson** / **R. Baas** / **Ryan Baas** a
 
 Set in `config.yaml` (`mode: lean|llm`) or override with `SCRAPE_MODE`.
 
-Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers an **active/in-range season that has divisions matching those levels** (so a newer empty overlap like Fall does not win over Summer III). Set `season` to force a name or uid. Single-division `leagueUrl` still works when `levels` is empty.
+Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers an in-range season with **posted** data for those levels (skips seasons that exist but are not posted yet — no matching divisions / no teams). Output includes `seasonStatus`. Empty team schedules are reported as “schedule not posted yet”. Set `season` to force a name or uid. Single-division `leagueUrl` still works when `levels` is empty.
 
 ## Requirements
 
@@ -29,6 +29,7 @@ Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers
 | `config.yaml` | Local only (gitignored) |
 | `python/main.py` | CLI entrypoint |
 | `python/lean_api.py` | Pub-api client (lean mode) |
+| `python/lean_http.py` | Robust lean HTTP (retries, circuit breaker, concurrency) |
 | `python/token_usage.py` | xAI token / cost accumulator |
 | `python/games.json` | Output (gitignored) |
 | `.env` (root or `python/`) | Secrets (gitignored); root `.env` is the fallback |
@@ -77,7 +78,8 @@ If `config.yaml` is missing, the scraper exits with an error that includes that 
 | `levels` | no | Name substrings for multi-div discovery (e.g. `Beer A`, `Beer B`). |
 | `siteUrl` | with levels | Club origin, e.g. `https://example.league.ninja`. |
 | `apiBaseUrl` | no | Override pub API base (inferred for known clubs). |
-| `season` | no | Optional season **name or uid** override. When empty, auto-pick prefers in-range seasons that have divisions matching `levels` (falls back if the newest overlap has none). |
+| `season` | no | Optional season **name or uid** override. When empty, auto-pick prefers in-range seasons that have **posted** data for `levels` (skips “not posted yet”). |
+| `http` | no | Lean HTTP knobs: timeouts, retries, Retry-After, circuit breaker, `concurrency` (default 4). |
 | `leagueUrl` | single-div | Division URL when `levels` is empty. |
 | `day` / `league` | no | Notes for single-div; multi-div uses API fields. |
 | `model` | no | xAI Grok id (default `grok-4-fast-reasoning`). |

@@ -69,8 +69,10 @@ from lean_api import (
     infer_api_base,
     list_seasons,
     pick_season_for_levels,
+    StandingsProbeError,
     standing_row_from_api,
 )
+from lean_http import CircuitTrippedError, HttpSettings, configure_http, get_client
 from token_usage import USAGE, reset_usage
 
 # ---------------------------------------------------------------------------
@@ -237,6 +239,49 @@ def describe_error(err: BaseException) -> str:
 # ---------------------------------------------------------------------------
 # Config model
 # ---------------------------------------------------------------------------
+
+class HttpConfig(BaseModel):
+    """Lean-mode HTTP policy (config.yaml → http:)."""
+
+    connect_timeout_s: float = Field(default=5.0, alias="connectTimeoutS")
+    read_timeout_s: float = Field(default=20.0, alias="readTimeoutS")
+    max_retries: int = Field(default=4, alias="maxRetries")
+    max_retries_total: int = Field(default=80, alias="maxRetriesTotal")
+    backoff_base_s: float = Field(default=0.4, alias="backoffBaseS")
+    backoff_max_s: float = Field(default=10.0, alias="backoffMaxS")
+    jitter_s: float = Field(default=0.3, alias="jitterS")
+    circuit_failure_threshold: int = Field(default=5, alias="circuitFailureThreshold")
+    circuit_cooldown_s: float = Field(default=20.0, alias="circuitCooldownS")
+    max_half_open_failures: int = Field(default=2, ge=1, alias="maxHalfOpenFailures")
+    max_circuit_trips: int = Field(default=3, ge=1, alias="maxCircuitTrips")
+    run_deadline_s: float = Field(default=120.0, gt=0, alias="runDeadlineS")
+    concurrency: int = Field(default=4, ge=1, le=32)
+    user_agent: str = Field(
+        default="stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)",
+        alias="userAgent",
+    )
+
+    model_config = {"populate_by_name": True}
+
+    def to_settings(self) -> HttpSettings:
+        return HttpSettings(
+            connect_timeout_s=self.connect_timeout_s,
+            read_timeout_s=self.read_timeout_s,
+            max_retries=self.max_retries,
+            max_retries_total=self.max_retries_total,
+            backoff_base_s=self.backoff_base_s,
+            backoff_max_s=self.backoff_max_s,
+            jitter_s=self.jitter_s,
+            circuit_failure_threshold=self.circuit_failure_threshold,
+            circuit_cooldown_s=self.circuit_cooldown_s,
+            max_half_open_failures=self.max_half_open_failures,
+            max_circuit_trips=self.max_circuit_trips,
+            run_deadline_s=self.run_deadline_s,
+            concurrency=self.concurrency,
+            user_agent=self.user_agent,
+        )
+
+
 class AppConfig(BaseModel):
     """User-editable knobs loaded from config.yaml."""
 
@@ -269,6 +314,8 @@ class AppConfig(BaseModel):
     # When empty, pick an in-range season that has divisions matching levels[]
     # (skips empty overlaps like Fall before Beer leagues exist).
     season: str = Field(default="")
+    # Lean HTTP robustness knobs (timeouts, retries, concurrency, circuit breaker).
+    http: HttpConfig = Field(default_factory=HttpConfig)
     # When true, the xAI HTTP client honors env proxy settings (HTTP(S)_PROXY).
     # Default false so a poisoned proxy env cannot intercept API traffic.
     http_trust_env: bool = Field(default=False, alias="httpTrustEnv")
@@ -1073,11 +1120,13 @@ async def page_mentions_any_team(page, team_names: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # Division discovery (shared by lean + llm multi-div)
 # ---------------------------------------------------------------------------
-def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, Any]]]:
+def discover_target_divisions(
+    config: AppConfig,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
     """
-    Return (season_name, divisions[]) to scrape.
+    Return (season_name, divisions[], season_status).
 
-    - If config.levels is non-empty: current season nav filtered by level substrings.
+    - If config.levels is non-empty: pick a season with posted data for those levels.
     - Else: single synthetic division from config.leagueUrl.
     """
     levels = list(config.levels)
@@ -1100,6 +1149,7 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
                     "singleDivision": True,
                 }
             ],
+            None,
         )
 
     api_base = infer_api_base(
@@ -1108,11 +1158,12 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
         league_url=config.league_url or None,
     )
     seasons = list_seasons(api_base)
-    season, matched, reason = pick_season_for_levels(
+    season, matched, reason, season_status = pick_season_for_levels(
         api_base,
         seasons,
         levels,
         season=config.season or None,
+        probe_standings=get_standings,
         log_fn=log,
     )
     season_uid = season["uid"]
@@ -1131,7 +1182,7 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
             }
         )
     log(f"levels={levels!r}: {len(out)} division(s) matched in {season_name!r}")
-    return season_name, out
+    return season_name, out, season_status
 
 
 def _merge_captain_details(
@@ -1184,24 +1235,27 @@ def _merge_captain_details(
 def scrape_lean(config: AppConfig) -> dict[str, Any]:
     """Full lean path: discover divisions, standings + schedule via pub API."""
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     t0 = time.perf_counter()
     reset_usage(model="")  # lean makes no LLM calls
+    configure_http(config.http.to_settings())
     captain_names = list(config.captain_name)
     config_team_name = config.team_name.strip()
     use_captain = len(captain_names) > 0
+    workers = max(1, int(config.http.concurrency))
 
     if use_captain:
-        log(f'Config: mode=lean captains={json.dumps(captain_names)} levels={config.levels!r}')
+        log(f'Config: mode=lean captains={json.dumps(captain_names)} levels={config.levels!r} concurrency={workers}')
     else:
-        log(f'Config: mode=lean team="{config_team_name}" levels={config.levels!r}')
+        log(f'Config: mode=lean team="{config_team_name}" levels={config.levels!r} concurrency={workers}')
 
     api_base = infer_api_base(
         api_base_url=config.api_base_url or None,
         site_url=config.site_url or None,
         league_url=config.league_url or None,
     )
-    season_name, divisions = discover_target_divisions(config)
+    season_name, divisions, season_status = discover_target_divisions(config)
 
     divisions_scanned: list[dict[str, Any]] = []
     division_errors: list[dict[str, Any]] = []
@@ -1210,9 +1264,11 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         [{"query": q, "matchedTeams": []} for q in captain_names] if use_captain else []
     )
     games: list[dict[str, Any]] = []
+    schedules_not_posted: list[dict[str, Any]] = []
     resolution: str | None = None
 
-    for div in divisions:
+    def _process_division(div: dict[str, Any]) -> dict[str, Any]:
+        """Per-division isolation: failures stay local to this result dict."""
         uid = div.get("divisionUid") or ""
         if not uid and div.get("singleDivision") and config.league_url:
             m = re.search(r"/division/([0-9a-fA-F-]{36})", config.league_url)
@@ -1220,19 +1276,31 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         division_name = div.get("divisionName") or ""
         league_name = div.get("leagueName") or config.league or ""
         day = div.get("dayOfWeek") or config.day or ""
+        result: dict[str, Any] = {
+            "uid": uid,
+            "division_name": division_name,
+            "league_name": league_name,
+            "day": day,
+            "div": div,
+            "error": None,
+            "matched": [],
+            "res": None,
+            "details": [],
+            "games": [],
+            "schedules_not_posted": [],
+            "meta": None,
+            "scanned": False,
+        }
         if not uid:
             msg = f"skip division with no uid: {division_name or '(unnamed)'}"
-            log(f"  {msg}")
-            division_errors.append(
-                {
-                    "divisionUid": None,
-                    "divisionName": division_name,
-                    "leagueName": league_name,
-                    "stage": "discover",
-                    "error": msg,
-                }
-            )
-            continue
+            result["error"] = {
+                "divisionUid": None,
+                "divisionName": division_name,
+                "leagueName": league_name,
+                "stage": "discover",
+                "error": msg,
+            }
+            return result
 
         url = div.get("url") or lean_division_url(
             config.site_url or config.league_url or "https://flannagans.league.ninja", uid
@@ -1244,18 +1312,19 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             "dayOfWeek": day,
             "url": url,
         }
-        divisions_scanned.append({**meta, "seasonName": div.get("seasonName") or season_name})
+        result["meta"] = meta
+        result["scanned"] = True
+        result["url"] = url
 
         try:
             rows_raw = get_standings(api_base, uid)
+        except CircuitTrippedError:
+            raise
         except LeanApiError as err:
-            log(f"  standings failed for {division_name or uid}: {err}")
-            division_errors.append({**meta, "stage": "standings", "error": str(err)})
-            continue
+            result["error"] = {**meta, "stage": "standings", "error": str(err)}
+            return result
 
-        rows = [
-            StandingsRow.model_validate(standing_row_from_api(r)) for r in rows_raw
-        ]
+        rows = [StandingsRow.model_validate(standing_row_from_api(r)) for r in rows_raw]
         matched, res, details = try_resolve_teams_from_standings(
             rows,
             use_captain=use_captain,
@@ -1263,57 +1332,178 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             config_team_name=config_team_name,
         )
         if not matched:
-            # Soft miss in this division (expected for multi-div captain/team scans).
-            continue
-        if res:
-            resolution = res
-        for d in details:
-            _merge_captain_details(captain_match_details, d, div_meta=meta)
+            return result
+        result["matched"] = matched
+        result["res"] = res
+        result["details"] = details
+        team_names = [tm.team_name for tm in matched]
 
-        team_names = [t.team_name for t in matched]
-        for t in matched:
-            all_matched_teams.append(
+        try:
+            schedule = get_schedule_v2(api_base, uid)
+        except CircuitTrippedError:
+            raise
+        except LeanApiError as err:
+            result["error"] = {**meta, "stage": "schedule", "error": str(err)}
+            return result
+
+        # Empty schedule body → not posted yet (not an error).
+        if not schedule:
+            for tm in matched:
+                result["schedules_not_posted"].append(
+                    {
+                        "teamName": tm.team_name,
+                        "divisionName": division_name,
+                        "leagueName": league_name,
+                        "divisionUid": uid,
+                        "status": "schedule not posted yet",
+                    }
+                )
+            return result
+
+        div_games = games_for_teams(schedule, team_names)
+        if matched and not div_games:
+            for tm in matched:
+                result["schedules_not_posted"].append(
+                    {
+                        "teamName": tm.team_name,
+                        "divisionName": division_name,
+                        "leagueName": league_name,
+                        "divisionUid": uid,
+                        "status": "schedule not posted yet",
+                    }
+                )
+        for g in div_games:
+            result["games"].append(
                 {
-                    "teamName": t.team_name,
-                    "captainName": t.captain_name,
-                    "record": t.record,
-                    "standing": t.standing,
+                    **g,
                     "divisionName": division_name,
                     "leagueName": league_name,
                     "day": day,
                     "url": url,
-                    "divisionUid": uid,
+                }
+            )
+        return result
+
+    # Preserve input order when merging concurrent results.
+    # On circuit trip / run abort: cancel remaining futures and stop (no long cooldown cascade).
+    ordered_results: list[dict[str, Any] | None] = [None] * len(divisions)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    future_map: dict[Any, int] = {}
+    try:
+        future_map = {
+            pool.submit(_process_division, div): idx for idx, div in enumerate(divisions)
+        }
+        for fut in as_completed(future_map):
+            abort = get_client().run_abort_error()
+            if abort is not None:
+                raise abort
+            idx = future_map[fut]
+            try:
+                ordered_results[idx] = fut.result()
+            except CircuitTrippedError:
+                raise
+            except Exception as err:  # noqa: BLE001 — isolate unexpected worker crashes
+                div = divisions[idx]
+                ordered_results[idx] = {
+                    "uid": div.get("divisionUid"),
+                    "division_name": div.get("divisionName") or "",
+                    "league_name": div.get("leagueName") or "",
+                    "day": div.get("dayOfWeek") or "",
+                    "div": div,
+                    "error": {
+                        "divisionUid": div.get("divisionUid"),
+                        "divisionName": div.get("divisionName"),
+                        "stage": "worker",
+                        "error": describe_error(err),
+                    },
+                    "matched": [],
+                    "res": None,
+                    "details": [],
+                    "games": [],
+                    "schedules_not_posted": [],
+                    "meta": None,
+                    "scanned": False,
+                }
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for result in ordered_results:
+        if result is None:
+            continue
+        div = result["div"]
+        meta = result.get("meta")
+        if result.get("scanned") and meta:
+            divisions_scanned.append(
+                {**meta, "seasonName": div.get("seasonName") or season_name}
+            )
+        if result.get("error"):
+            err = result["error"]
+            log(
+                f"  {err.get('stage', 'error')} failed for "
+                f"{err.get('divisionName') or err.get('divisionUid')}: {err.get('error')}"
+            )
+            division_errors.append(err)
+        matched = result.get("matched") or []
+        if not matched:
+            continue
+        if result.get("res"):
+            resolution = result["res"]
+        for d in result.get("details") or []:
+            if meta:
+                _merge_captain_details(captain_match_details, d, div_meta=meta)
+        for tm in matched:
+            all_matched_teams.append(
+                {
+                    "teamName": tm.team_name,
+                    "captainName": tm.captain_name,
+                    "record": tm.record,
+                    "standing": tm.standing,
+                    "divisionName": result["division_name"],
+                    "leagueName": result["league_name"],
+                    "day": result["day"],
+                    "url": result.get("url") or (meta or {}).get("url"),
+                    "divisionUid": result["uid"],
                 }
             )
         log(
-            f"  matched in {division_name}: "
-            + ", ".join(f'"{t.team_name}" (captain={t.captain_name or "?"})' for t in matched)
+            f"  matched in {result['division_name']}: "
+            + ", ".join(f'"{tm.team_name}" (captain={tm.captain_name or "?"})' for tm in matched)
         )
-
-        try:
-            schedule = get_schedule_v2(api_base, uid)
-        except LeanApiError as err:
-            log(f"  schedule failed for {division_name or uid}: {err}")
-            division_errors.append({**meta, "stage": "schedule", "error": str(err)})
-            # Do not drop matched teams; record the error and continue other divisions.
-            continue
-        div_games = games_for_teams(schedule, team_names)
-        for g in div_games:
-            g = {
-                **g,
-                "divisionName": division_name,
-                "leagueName": league_name,
-                "day": day,
-                "url": url,
-            }
-            games.append(g)
-        log(f"    -> {len(div_games)} game(s)")
+        for snp in result.get("schedules_not_posted") or []:
+            schedules_not_posted.append(snp)
+            log(
+                f"    -> schedule not posted yet for \"{snp.get('teamName')}\" "
+                f"in {snp.get('divisionName')}"
+            )
+        div_games = result.get("games") or []
+        games.extend(div_games)
+        if div_games:
+            log(f"    -> {len(div_games)} game(s)")
 
     season_hint = (
         f' Season scanned: {season_name or "(unknown)"}. '
         f'If this is the wrong season (e.g. Fall with no Beer A/B), set config '
         f'season to a name or uid (see config.example.yaml), e.g. season: "Summer III- 2026".'
     )
+    abort = get_client().run_abort_error()
+    if abort is not None:
+        raise abort
+    http_stats_pre = get_client().stats
+    circuit_blocked = [
+        e
+        for e in division_errors
+        if "Circuit open" in str(e.get("error") or "")
+        or "circuit" in str(e.get("error") or "").lower()
+        or "circuit breaker" in str(e.get("error") or "").lower()
+    ]
+    if http_stats_pre.circuit_trips > 0 and (
+        circuit_blocked or http_stats_pre.circuit_open_rejections > 0
+    ):
+        raise CircuitTrippedError(
+            f"HTTP circuit breaker tripped ({http_stats_pre.circuit_trips} trip(s)); "
+            f"{len(circuit_blocked) or http_stats_pre.circuit_open_rejections} division "
+            f"request(s) failed while the circuit was open. Refusing to overwrite games.json."
+        )
     if use_captain and not all_matched_teams:
         raise ResolveError(
             f"No standings row matched captainName={json.dumps(captain_names)} "
@@ -1326,13 +1516,16 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         )
 
     elapsed = time.perf_counter() - t0
-    team_names_flat = [t["teamName"] for t in all_matched_teams]
+    team_names_flat = [tm["teamName"] for tm in all_matched_teams]
+    http_stats = get_client().stats.as_dict()
     output: dict[str, Any] = {
         "mode": "lean",
         "levels": config.levels or None,
         "seasonName": season_name or None,
+        "seasonStatus": season_status,
         "divisionsScanned": divisions_scanned,
         "divisionErrors": division_errors or None,
+        "schedulesNotPosted": schedules_not_posted or None,
         "captainSearched": (
             (captain_names[0] if len(captain_names) == 1 else captain_names)
             if use_captain
@@ -1349,6 +1542,7 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         "games": games,
         "tokenUsage": USAGE.as_dict(),
         "runtimeSeconds": round(elapsed, 3),
+        "http": http_stats,
     }
     if len(all_matched_teams) == 1:
         output["teamRecord"] = all_matched_teams[0].get("record")
@@ -1356,8 +1550,11 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         output["leagueName"] = all_matched_teams[0].get("leagueName")
         output["divisionName"] = all_matched_teams[0].get("divisionName")
     USAGE.print_summary(log)
-    log(f"Lean scrape finished in {elapsed:.2f}s")
+    for line in get_client().stats.log_lines():
+        log(line)
+    log(f"Lean scrape finished in {elapsed:.2f}s (concurrency={workers})")
     return output
+
 
 
 # ---------------------------------------------------------------------------
@@ -1497,6 +1694,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
     import time
 
     t0 = time.perf_counter()
+    configure_http(config.http.to_settings())
     model_id = resolve_grok_model_id(config.model)
     reset_usage(model=model_id)
 
@@ -1518,7 +1716,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
         log(f'Config: mode=llm team="{config_team_name}" levels={config.levels!r} model={model_id!r}')
 
     create_kwargs = model_kwargs(config.model, trust_env=config.http_trust_env)
-    season_name, divisions = discover_target_divisions(config)
+    season_name, divisions, season_status = discover_target_divisions(config)
 
     suffix = config.schedule_path_suffix
     if not suffix.startswith("/"):
@@ -1690,6 +1888,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
                 "mode": "llm",
                 "levels": config.levels or None,
                 "seasonName": season_name or None,
+                "seasonStatus": season_status,
                 "divisionsScanned": divisions_scanned,
                 "captainSearched": (
                     (captain_names[0] if len(captain_names) == 1 else captain_names)
@@ -1862,7 +2061,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"teamName: {config.team_name!r}")
             return
         asyncio.run(async_main(args.config, args.env_file))
-    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, LeanApiError) as err:
+    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, CircuitTrippedError, StandingsProbeError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.
         print(describe_error(err), file=sys.stderr)

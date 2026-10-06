@@ -160,7 +160,7 @@ def test_pick_season_for_levels_skips_empty_fall_oct26():
         ]
 
     logs: list[str] = []
-    season, matched, reason = pick_season_for_levels(
+    season, matched, _reason, status = pick_season_for_levels(
         "https://api.example",
         seasons,
         levels,
@@ -170,8 +170,9 @@ def test_pick_season_for_levels_skips_empty_fall_oct26():
     )
     assert season["uid"] == "summer-uid"
     assert len(matched) == 2
-    assert "Fall" in reason or "skipped" in reason.lower()
-    assert any("Season pick" in m or "skipped" in m.lower() for m in logs) or "skipped" in reason.lower()
+    assert status["picked"]["uid"] == "summer-uid"
+    assert any(s["reason"] == "not posted yet" for s in status["skipped"])
+    assert status["skipped"][0]["name"] == "Fall 2026"
 
 
 def test_pick_season_for_levels_override_skips_fallback():
@@ -207,3 +208,190 @@ def test_pick_season_for_levels_override_skips_fallback():
             season="Fall 2026",
             list_divisions=fake_list,
         )
+
+
+def test_pick_season_skips_empty_standings_as_not_posted():
+    """Divisions matching levels but with no teams → not posted yet; fall back."""
+    from lean_api import pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "new-uid",
+            "name": "Fall 2026",
+            "startDate": "2026-10-25T16:00:00",
+            "endDate": "2027-01-15T00:00:00",
+        },
+        {
+            "uid": "summer-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Sunday Beer (A)", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        if uid.startswith("new-uid"):
+            return []  # no teams yet
+        return [{"teamName": "Him-Roids", "captainName": "R. Baas"}]
+
+    season, _matched, _reason, status = pick_season_for_levels(
+        "https://api.example",
+        seasons,
+        ["Beer A"],
+        now=now,
+        list_divisions=fake_list,
+        probe_standings=fake_standings,
+    )
+    assert season["uid"] == "summer-uid"
+    assert status["skipped"][0]["name"] == "Fall 2026"
+    assert status["skipped"][0]["reason"] == "not posted yet"
+    assert status["picked"]["name"] == "Summer III- 2026"
+
+
+def test_all_standings_probes_error_raises_no_fallback():
+    """Every probe raising LeanApiError → StandingsProbeError; do not fall back."""
+    from lean_api import LeanApiError, StandingsProbeError, pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "bad-uid",
+            "name": "Fall 2026",
+            "startDate": "2026-10-01T00:00:00",
+            "endDate": "2026-12-01T00:00:00",
+        },
+        {
+            "uid": "good-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Beer A", "leagueName": "Beer A"},
+            {"divisionUid": f"{uid}-d2", "divisionName": "Beer A2", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        raise LeanApiError("HTTP 500 for standings")
+
+    with pytest.raises(StandingsProbeError, match="Standings probe failed"):
+        pick_season_for_levels(
+            "https://api.example",
+            seasons,
+            ["Beer A"],
+            now=now,
+            list_divisions=fake_list,
+            probe_standings=fake_standings,
+        )
+
+
+def test_mixed_probe_error_and_empty_raises_no_fallback():
+    """One probe errors + another returns empty (no teams) → raise, do not fall back."""
+    from lean_api import LeanApiError, StandingsProbeError, pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "fall-uid",
+            "name": "Fall 2026",
+            "startDate": "2026-10-01T00:00:00",
+            "endDate": "2026-12-01T00:00:00",
+        },
+        {
+            "uid": "summer-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Beer A", "leagueName": "Beer A"},
+            {"divisionUid": f"{uid}-d2", "divisionName": "Beer A2", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        if uid.endswith("-d1"):
+            raise LeanApiError("HTTP 503 for standings")
+        return []  # empty
+
+    with pytest.raises(StandingsProbeError, match="Standings probe failed"):
+        pick_season_for_levels(
+            "https://api.example",
+            seasons,
+            ["Beer A"],
+            now=now,
+            list_divisions=fake_list,
+            probe_standings=fake_standings,
+        )
+
+
+def test_standings_probe_error_leaves_games_json_untouched(tmp_path, monkeypatch):
+    """StandingsProbeError → exit 1 and do not overwrite an existing games.json."""
+    import main as main_mod
+    from lean_api import StandingsProbeError
+
+    games = tmp_path / "games.json"
+    original = '{"matchedTeams":["keep-me"],"games":[{"t":1}]}'
+    games.write_text(original, encoding="utf-8")
+
+    async def _boom(_cli=None, _env=None):
+        raise StandingsProbeError(
+            "Standings probe failed for season 'Fall 2026'; refusing to overwrite games.json."
+        )
+
+    monkeypatch.setattr(main_mod, "scrape", _boom)
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    monkeypatch.setattr(main_mod, "_RUNNING_FROM_SOURCE", True)
+
+    with pytest.raises(SystemExit) as ei:
+        main_mod.main([])
+    assert ei.value.code == 1
+    assert games.read_text(encoding="utf-8") == original
+
+
+def test_probe_error_then_teams_still_posts():
+    """If any probe returns teams, season is posted even if another probe errored earlier."""
+    from lean_api import LeanApiError, pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "mixed-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Beer A", "leagueName": "Beer A"},
+            {"divisionUid": f"{uid}-d2", "divisionName": "Beer A2", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        if uid.endswith("-d1"):
+            raise LeanApiError("HTTP 500 for standings")
+        return [{"teamName": "Him-Roids", "captainName": "R. Baas"}]
+
+    season, _matched, _reason, status = pick_season_for_levels(
+        "https://api.example",
+        seasons,
+        ["Beer A"],
+        now=now,
+        list_divisions=fake_list,
+        probe_standings=fake_standings,
+    )
+    assert season["uid"] == "mixed-uid"
+    assert status["picked"]["uid"] == "mixed-uid"
