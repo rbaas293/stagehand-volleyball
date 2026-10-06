@@ -35,6 +35,28 @@ Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers
 
 The scraper code stays under **`python/`** (not moved to repo root) so existing packaging/CI that targets `python/` (see PR #3) keeps working without path rewrites. Root owns config and docs only.
 
+## Config file location
+
+Env files are **not** auto-loaded from the cwd for installed binaries. Use
+`--env-file PATH`, or rely on `python/.env` / repo-root `.env` in a source
+checkout. Only known keys are imported from those files. Set `httpTrustEnv: true`
+in config.yaml only if you intentionally want the xAI client to honor proxy env
+vars.
+
+
+
+The scraper resolves `config.yaml` in this order:
+
+1. `--config PATH` on the CLI
+2. `$STAGEHAND_VOLLEYBALL_CONFIG`
+3. `./config.yaml` in the current working directory
+4. Repo-root `config.yaml` (and optional `python/config.yaml`) **only when running from a source checkout**
+
+Installed wheels / shiv binaries do **not** look next to the package in site-packages.
+If nothing is found, the error lists every path tried and reminds you to
+`cp config.example.yaml config.yaml`. `.env` is loaded from the cwd as well
+(shell exports still win). Use `--check-config` to validate a config without scraping.
+
 ## Config
 
 `config.yaml` is **local only** (gitignored). Start from the public template:
