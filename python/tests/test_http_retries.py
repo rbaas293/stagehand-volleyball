@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lean_http import (  # noqa: E402
-    CircuitOpenError,
+    CircuitTrippedError,
     HttpSettings,
     LeanApiError,
     LeanHttpClient,
@@ -173,7 +173,7 @@ def test_circuit_breaker_opens_after_consecutive_failures():
         max_retries=1,
         max_retries_total=20,
         circuit_failure_threshold=3,
-        circuit_cooldown_s=30,
+        circuit_cooldown_s=0.01,
         backoff_base_s=0.01,
         jitter_s=0,
     )
@@ -189,6 +189,112 @@ def test_circuit_breaker_opens_after_consecutive_failures():
         for _ in range(3):
             with pytest.raises(LeanApiError):
                 client.get_json("https://example.test/api")
-        with pytest.raises(CircuitOpenError, match="Circuit open"):
+        assert client.stats.circuit_trips == 1
+        # Half-open probe also fails → circuit re-opens (second trip).
+        with pytest.raises(LeanApiError):
             client.get_json("https://example.test/api")
-    assert client.stats.circuit_trips >= 1
+    assert client.stats.circuit_trips >= 2
+
+
+
+def test_four_xx_except_429_do_not_open_circuit():
+    """5x 404 then a 200 must succeed; breaker never opens."""
+    client = LeanHttpClient(
+        HttpSettings(
+            max_retries=1,
+            max_retries_total=20,
+            circuit_failure_threshold=3,
+            circuit_cooldown_s=0.01,
+            backoff_base_s=0.01,
+            jitter_s=0,
+        )
+    )
+    conn = MagicMock()
+    calls = {"n": 0}
+
+    def getresponse():
+        calls["n"] += 1
+        if calls["n"] <= 5:
+            resp = MagicMock()
+            resp.status = 404
+            resp.reason = "Not Found"
+            resp.headers = {}
+            resp.read.return_value = b""
+            return resp
+        return _ok_response({"Data": {"ok": True}, "StatusCode": 200})
+
+    conn.request = MagicMock()
+    conn.getresponse.side_effect = getresponse
+    conn.sock = MagicMock()
+
+    with patch.object(client, "_get_conn", return_value=conn), patch("lean_http.time.sleep"):
+        for _ in range(5):
+            with pytest.raises(LeanApiError, match="HTTP 404"):
+                client.get_json("https://example.test/d")
+        data = client.get_json("https://example.test/d")
+    assert data == {"ok": True}
+    assert client.stats.circuit_trips == 0
+    assert client._circuit_state.get("https://example.test:443", "closed") == "closed"
+
+
+def test_five_xx_opens_breaker_half_open_probe_closes():
+    """5xx failures open the breaker; after cooldown a successful probe closes it."""
+    client = LeanHttpClient(
+        HttpSettings(
+            max_retries=1,
+            max_retries_total=50,
+            circuit_failure_threshold=3,
+            circuit_cooldown_s=0.01,
+            backoff_base_s=0.01,
+            jitter_s=0,
+        )
+    )
+    conn = MagicMock()
+    calls = {"n": 0}
+
+    def getresponse():
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            resp = MagicMock()
+            resp.status = 503
+            resp.reason = "Unavailable"
+            resp.headers = {}
+            resp.read.return_value = b""
+            return resp
+        return _ok_response({"Data": [1], "StatusCode": 200})
+
+    conn.request = MagicMock()
+    conn.getresponse.side_effect = getresponse
+    conn.sock = MagicMock()
+
+    with patch.object(client, "_get_conn", return_value=conn), patch("lean_http.time.sleep"):
+        for _ in range(3):
+            with pytest.raises(LeanApiError, match="HTTP 503"):
+                client.get_json("https://example.test/api")
+        assert client.stats.circuit_trips == 1
+        # Cooldown elapsed (sleep patched / cooldown tiny); this call is the half-open probe.
+        data = client.get_json("https://example.test/api")
+    assert data == [1]
+    assert client._circuit_state.get("https://example.test:443", "closed") == "closed"
+
+
+def test_circuit_tripped_error_leaves_games_json_untouched(tmp_path, monkeypatch):
+    """CircuitTrippedError → exit 1 and do not overwrite an existing games.json."""
+    import main as main_mod
+
+    games = tmp_path / "games.json"
+    original = '{"matchedTeams":["keep-me"],"games":[{"t":1}]}'
+    games.write_text(original, encoding="utf-8")
+
+    async def _boom(_cli=None, _env=None):
+        raise CircuitTrippedError("circuit tripped for test")
+
+    monkeypatch.setattr(main_mod, "scrape", _boom)
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    # Force OUTPUT_PATH into tmp via _RUNNING_FROM_SOURCE True path: ROOT/games.json
+    monkeypatch.setattr(main_mod, "_RUNNING_FROM_SOURCE", True)
+
+    with pytest.raises(SystemExit) as ei:
+        main_mod.main([])
+    assert ei.value.code == 1
+    assert games.read_text(encoding="utf-8") == original

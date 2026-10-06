@@ -84,6 +84,7 @@ class HttpRunStats:
     retry_after_honored: int = 0
     partial_json_retries: int = 0
     circuit_trips: int = 0
+    circuit_open_rejections: int = 0
     by_error: dict[str, int] = field(default_factory=dict)
 
     def record_error(self, label: str) -> None:
@@ -98,6 +99,7 @@ class HttpRunStats:
             "retryAfterHonored": self.retry_after_honored,
             "partialJsonRetries": self.partial_json_retries,
             "circuitTrips": self.circuit_trips,
+            "circuitOpenRejections": self.circuit_open_rejections,
             "byError": dict(self.by_error) or None,
         }
 
@@ -107,7 +109,8 @@ class HttpRunStats:
                 f"HTTP summary: attempts={self.attempts} successes={self.successes} "
                 f"failures={self.failures} retries={self.retries} "
                 f"retryAfter={self.retry_after_honored} partialJson={self.partial_json_retries} "
-                f"circuitTrips={self.circuit_trips}"
+                f"circuitTrips={self.circuit_trips} "
+                f"circuitRejections={self.circuit_open_rejections}"
             )
         ]
         if self.by_error:
@@ -117,7 +120,11 @@ class HttpRunStats:
 
 
 class CircuitOpenError(LeanApiError):
-    """Host circuit breaker is open."""
+    """Host circuit breaker is open / probe wait timed out."""
+
+
+class CircuitTrippedError(LeanApiError):
+    """Circuit breaker tripped and caused division failures; do not overwrite games.json."""
 
 
 def _host_key(parsed: urllib.parse.ParseResult) -> str:
@@ -153,6 +160,8 @@ class LeanHttpClient:
         self._local = threading.local()
         self._fail_streak: dict[str, int] = {}
         self._circuit_until: dict[str, float] = {}
+        self._circuit_state: dict[str, str] = {}  # closed | open | half_open
+        self._half_open_holder: dict[str, int | None] = {}
         self._retries_used = 0
         self._ssl_ctx = ssl.create_default_context()
 
@@ -162,6 +171,8 @@ class LeanHttpClient:
             self._retries_used = 0
             self._fail_streak.clear()
             self._circuit_until.clear()
+            self._circuit_state.clear()
+            self._half_open_holder.clear()
 
     def configure(self, settings: HttpSettings) -> None:
         with self._lock:
@@ -190,41 +201,86 @@ class LeanHttpClient:
         with self._lock:
             self._close_all_unlocked()
 
+    def _open_circuit(self, host: str) -> None:
+        """Transition host to open; count a trip once per opening."""
+        self._circuit_state[host] = "open"
+        self._circuit_until[host] = time.monotonic() + self.settings.circuit_cooldown_s
+        self._half_open_holder[host] = None
+        self._fail_streak[host] = 0
+        self.stats.circuit_trips += 1
+        conn = self._thread_conns().pop(host, None)
+        if conn:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     def _check_circuit(self, host: str) -> None:
-        until = self._circuit_until.get(host, 0.0)
-        if until and time.monotonic() < until:
-            self.stats.circuit_trips += 1
-            raise CircuitOpenError(
-                f"Circuit open for {host} for {until - time.monotonic():.1f}s more "
-                f"(after {self.settings.circuit_failure_threshold} consecutive failures)"
-            )
-        if until and time.monotonic() >= until:
-            self._circuit_until.pop(host, None)
-            self._fail_streak[host] = 0
+        """
+        Closed: proceed.
+        Open: wait the remaining cooldown (bounded), then become half-open probe.
+        Half-open: only the probe holder proceeds; others wait briefly for resolution.
+        """
+        tid = threading.get_ident()
+        deadline = time.monotonic() + max(self.settings.circuit_cooldown_s * 3, 1.0)
+        while True:
+            wait_for = 0.0
+            with self._lock:
+                state = self._circuit_state.get(host, "closed")
+                if state == "closed":
+                    return
+                if state == "open":
+                    remaining = self._circuit_until.get(host, 0.0) - time.monotonic()
+                    if remaining > 0:
+                        wait_for = min(remaining, self.settings.circuit_cooldown_s)
+                    elif self._half_open_holder.get(host) is None:
+                        self._circuit_state[host] = "half_open"
+                        self._half_open_holder[host] = tid
+                        return
+                    else:
+                        wait_for = 0.05
+                elif state == "half_open":
+                    if self._half_open_holder.get(host) == tid:
+                        return
+                    wait_for = 0.05
+            if time.monotonic() >= deadline:
+                with self._lock:
+                    self.stats.circuit_open_rejections += 1
+                raise CircuitOpenError(
+                    f"Circuit open for {host}: timed out waiting for cooldown/probe "
+                    f"(after {self.settings.circuit_failure_threshold} consecutive failures)"
+                )
+            if wait_for > 0:
+                time.sleep(wait_for)
 
     def _record_success(self, host: str) -> None:
         with self._lock:
             self._fail_streak[host] = 0
             self.stats.successes += 1
+            # Half-open probe succeeded → close the circuit.
+            if self._circuit_state.get(host) == "half_open":
+                self._circuit_state[host] = "closed"
+                self._circuit_until.pop(host, None)
+                self._half_open_holder[host] = None
 
-    def _record_failure(self, host: str, label: str) -> None:
+    def _record_failure(self, host: str, label: str, *, toward_breaker: bool = True) -> None:
+        """
+        Record a failure. Only transport / 5xx / 429 count toward the breaker.
+        Other 4xx (e.g. 404) must not open the circuit.
+        """
         with self._lock:
             self.stats.failures += 1
             self.stats.record_error(label)
+            if not toward_breaker:
+                return
+            if self._circuit_state.get(host) == "half_open":
+                # Probe failed → re-open.
+                self._open_circuit(host)
+                return
             streak = self._fail_streak.get(host, 0) + 1
             self._fail_streak[host] = streak
             if streak >= self.settings.circuit_failure_threshold:
-                self._circuit_until[host] = (
-                    time.monotonic() + self.settings.circuit_cooldown_s
-                )
-                self.stats.circuit_trips += 1
-                # Drop pooled connection; it may be bad.
-                conn = self._thread_conns().pop(host, None)
-                if conn:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+                self._open_circuit(host)
 
     def _get_conn(self, parsed: urllib.parse.ParseResult, host: str) -> http.client.HTTPConnection:
         conns = self._thread_conns()
@@ -334,6 +390,7 @@ class LeanHttpClient:
                 last_err = err
                 retry_after = _parse_retry_after(getattr(err, "headers", None))
                 retryable = err.code in (429, 500, 502, 503, 504)
+                counts_for_breaker = err.code == 429 or err.code >= 500
                 if retryable and attempt < attempts and self._budget_allow_retry():
                     self._invalidate_conn(host)
                     self._sleep_backoff(
@@ -341,7 +398,9 @@ class LeanHttpClient:
                         retry_after=retry_after if err.code in (429, 503) else None,
                     )
                     continue
-                self._record_failure(host, f"http_{err.code}")
+                self._record_failure(
+                    host, f"http_{err.code}", toward_breaker=counts_for_breaker
+                )
                 raise LeanApiError(f"HTTP {err.code} for {url}: {err.reason or err}") from err
             except (http.client.HTTPException, OSError, TimeoutError) as err:
                 last_err = err

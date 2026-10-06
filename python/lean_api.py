@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from lean_http import (
     CircuitOpenError,
+    CircuitTrippedError,
     HttpSettings,
     LeanApiError,
     configure_http,
@@ -45,6 +46,7 @@ _API_BY_SITE_HOST = {
 # Re-export for callers / tests.
 __all__ = [
     "CircuitOpenError",
+    "CircuitTrippedError",
     "HttpSettings",
     "LeanApiError",
     "configure_http",
@@ -211,18 +213,29 @@ def _season_has_posted_data(
         return True, "has matching divisions"
     empty = 0
     probed = 0
+    probe_errors = 0
     for d in matched[: max(1, probe_limit)]:
         uid = str(d.get("divisionUid") or "")
         if not uid:
             continue
         probed += 1
-        rows = probe_standings(api_base, uid)
+        try:
+            rows = probe_standings(api_base, uid)
+        except LeanApiError:
+            # Persistent 5xx / transport on one division must not abort season pick.
+            probe_errors += 1
+            continue
         if rows:
             return True, "has teams in standings"
         empty += 1
     if probed == 0:
         return True, "has matching divisions"
+    # All probes errored → treat as not posted yet and try next season.
+    if probe_errors and empty == 0 and probe_errors == probed:
+        return False, NOT_POSTED_YET
     if empty == probed:
+        return False, NOT_POSTED_YET
+    if empty + probe_errors == probed:
         return False, NOT_POSTED_YET
     return True, "has matching divisions"
 

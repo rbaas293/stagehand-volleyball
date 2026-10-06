@@ -71,7 +71,7 @@ from lean_api import (
     pick_season_for_levels,
     standing_row_from_api,
 )
-from lean_http import HttpSettings, configure_http, get_client
+from lean_http import CircuitTrippedError, HttpSettings, configure_http, get_client
 from token_usage import USAGE, reset_usage
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1464,21 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         f'If this is the wrong season (e.g. Fall with no Beer A/B), set config '
         f'season to a name or uid (see config.example.yaml), e.g. season: "Summer III- 2026".'
     )
+    http_stats_pre = get_client().stats
+    circuit_blocked = [
+        e
+        for e in division_errors
+        if "Circuit open" in str(e.get("error") or "")
+        or "circuit" in str(e.get("error") or "").lower()
+    ]
+    if http_stats_pre.circuit_trips > 0 and (
+        circuit_blocked or http_stats_pre.circuit_open_rejections > 0
+    ):
+        raise CircuitTrippedError(
+            f"HTTP circuit breaker tripped ({http_stats_pre.circuit_trips} trip(s)); "
+            f"{len(circuit_blocked) or http_stats_pre.circuit_open_rejections} division "
+            f"request(s) failed while the circuit was open. Refusing to overwrite games.json."
+        )
     if use_captain and not all_matched_teams:
         raise ResolveError(
             f"No standings row matched captainName={json.dumps(captain_names)} "
@@ -2021,7 +2036,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"teamName: {config.team_name!r}")
             return
         asyncio.run(async_main(args.config, args.env_file))
-    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, LeanApiError) as err:
+    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, CircuitTrippedError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.
         print(describe_error(err), file=sys.stderr)

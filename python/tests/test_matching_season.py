@@ -252,3 +252,49 @@ def test_pick_season_skips_empty_standings_as_not_posted():
     assert status["skipped"][0]["name"] == "Fall 2026"
     assert status["skipped"][0]["reason"] == "not posted yet"
     assert status["picked"]["name"] == "Summer III- 2026"
+
+
+def test_season_probe_skips_lean_api_error_and_continues():
+    """Persistent 500 on first standings probe must not abort; try next division/season."""
+    from lean_api import LeanApiError, pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "bad-uid",
+            "name": "Broken Season",
+            "startDate": "2026-10-01T00:00:00",
+            "endDate": "2026-12-01T00:00:00",
+        },
+        {
+            "uid": "good-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Beer A", "leagueName": "Beer A"},
+            {"divisionUid": f"{uid}-d2", "divisionName": "Beer A2", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        if uid == "bad-uid-d1":
+            raise LeanApiError("HTTP 500 for standings")
+        if uid.startswith("bad-uid"):
+            return []  # empty → not posted
+        return [{"teamName": "Him-Roids", "captainName": "R. Baas"}]
+
+    season, matched, _reason, status = pick_season_for_levels(
+        "https://api.example",
+        seasons,
+        ["Beer A"],
+        now=now,
+        list_divisions=fake_list,
+        probe_standings=fake_standings,
+    )
+    assert season["uid"] == "good-uid"
+    assert status["picked"]["uid"] == "good-uid"
+    assert any(s["name"] == "Broken Season" for s in status["skipped"])
