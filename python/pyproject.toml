@@ -59,4 +59,6 @@ select = ["E", "F", "I", "W", "UP"]
 ignore = [
     "E501",  # line length: long comment lines are intentional in this codebase
     "I001",  # isort: keep hand-aligned import comments in main.py
+    "UP017", # codebase uses datetime.timezone.utc consistently
+    "E402",  # tests adjust sys.path before importing local modules
 ]

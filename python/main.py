@@ -60,14 +60,11 @@ from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local
 from lean_api import (
     LeanApiError,
     division_url as lean_division_url,
-    filter_divisions_by_levels,
     games_for_teams,
     get_schedule_v2,
     get_standings,
     infer_api_base,
-    list_season_divisions,
     list_seasons,
-    pick_current_season,
     pick_season_for_levels,
     standing_row_from_api,
 )
