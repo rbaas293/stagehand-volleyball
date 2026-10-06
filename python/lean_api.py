@@ -13,6 +13,7 @@ https://flan1-lms-pub-api.league.ninja with endpoints:
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -30,10 +31,14 @@ _RESULT_CANCELLED = 2
 
 _ET = ZoneInfo("America/New_York")
 
-# Known club hostname → pub API host (SPA ninjaOrg.apiPub).
 _API_BY_SITE_HOST = {
     "flannagans.league.ninja": "https://flan1-lms-pub-api.league.ninja",
 }
+
+# Default HTTP policy for lean mode.
+_DEFAULT_TIMEOUT_S = 20.0
+_DEFAULT_RETRIES = 3
+_DEFAULT_BACKOFF_S = 0.5
 
 
 class LeanApiError(Exception):
@@ -50,7 +55,6 @@ def infer_api_base(*, api_base_url: str | None, site_url: str | None, league_url
         host = urlparse(candidate.strip()).netloc.lower()
         if host in _API_BY_SITE_HOST:
             return _API_BY_SITE_HOST[host]
-        # Generic guess: <sub>.league.ninja → often club-specific; require explicit apiBaseUrl.
     raise LeanApiError(
         "Cannot infer apiBaseUrl. Set apiBaseUrl (e.g. https://flan1-lms-pub-api.league.ninja) "
         "or use a known siteUrl/leagueUrl host (flannagans.league.ninja)."
@@ -59,39 +63,74 @@ def infer_api_base(*, api_base_url: str | None, site_url: str | None, league_url
 
 def division_url(site_url: str, div_uid: str) -> str:
     base = (site_url or "https://flannagans.league.ninja").rstrip("/")
-    # siteUrl may already be a full division URL — use origin only.
     parsed = urlparse(base)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     return f"{origin}/leagues/division/{div_uid}"
 
 
-def _http_get_json(url: str, *, timeout: float = 30.0) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as err:
-        raise LeanApiError(f"HTTP {err.code} for {url}") from err
-    except urllib.error.URLError as err:
-        raise LeanApiError(f"Request failed for {url}: {err}") from err
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as err:
-        raise LeanApiError(f"Non-JSON response from {url}") from err
-    # Pub API wraps payloads as {StatusCode, Data, ErrorMessage}.
-    if isinstance(payload, dict) and "Data" in payload and "StatusCode" in payload:
-        if payload.get("StatusCode") not in (200, None) and payload.get("Data") is None:
-            raise LeanApiError(
-                f"API error for {url}: {payload.get('ErrorMessage') or payload.get('StatusCode')}"
-            )
-        return payload["Data"]
-    return payload
+def _http_get_json(
+    url: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_S,
+    retries: int = _DEFAULT_RETRIES,
+    backoff_s: float = _DEFAULT_BACKOFF_S,
+) -> Any:
+    """
+    GET JSON with timeout, retries/backoff on transient failures, and clear errors.
+
+    Retries on URLError / timeouts / HTTP 5xx / 429. Non-retryable 4xx raise immediately.
+    """
+    last_err: BaseException | None = None
+    attempts = max(1, retries)
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                # urllib raises HTTPError for non-2xx; still guard status.
+                status = getattr(resp, "status", None) or resp.getcode()
+                if status is not None and int(status) >= 400:
+                    raise urllib.error.HTTPError(
+                        url, int(status), f"HTTP {status}", resp.headers, None
+                    )
+                body = resp.read().decode("utf-8")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as err:
+                raise LeanApiError(f"Non-JSON response from {url}") from err
+            if isinstance(payload, dict) and "Data" in payload and "StatusCode" in payload:
+                code = payload.get("StatusCode")
+                if code not in (200, None) and payload.get("Data") is None:
+                    raise LeanApiError(
+                        f"API error for {url}: {payload.get('ErrorMessage') or code}"
+                    )
+                return payload["Data"]
+            return payload
+        except urllib.error.HTTPError as err:
+            last_err = err
+            # Retry 429 and 5xx only.
+            if err.code in (429, 500, 502, 503, 504) and attempt < attempts:
+                time.sleep(backoff_s * (2 ** (attempt - 1)))
+                continue
+            raise LeanApiError(f"HTTP {err.code} for {url}: {err.reason or err}") from err
+        except urllib.error.URLError as err:
+            last_err = err
+            if attempt < attempts:
+                time.sleep(backoff_s * (2 ** (attempt - 1)))
+                continue
+            raise LeanApiError(f"Request failed for {url} after {attempts} attempt(s): {err}") from err
+        except TimeoutError as err:
+            last_err = err
+            if attempt < attempts:
+                time.sleep(backoff_s * (2 ** (attempt - 1)))
+                continue
+            raise LeanApiError(f"Timed out fetching {url} after {attempts} attempt(s)") from err
+    raise LeanApiError(f"Request failed for {url}: {last_err}")
 
 
 def list_seasons(api_base: str) -> list[dict[str, Any]]:
@@ -101,32 +140,77 @@ def list_seasons(api_base: str) -> list[dict[str, Any]]:
     return data
 
 
-def pick_current_season(seasons: list[dict[str, Any]], *, now: datetime | None = None) -> dict[str, Any]:
-    """Prefer the season whose [start, end] contains now (UTC); else latest startDate."""
-    now = now or datetime.now(timezone.utc)
+def _parse_api_dt(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "")).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
-    def parse_dt(raw: str | None) -> datetime | None:
-        if not raw:
-            return None
-        try:
-            # API timestamps are naive UTC.
-            return datetime.fromisoformat(raw.replace("Z", "")).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
 
-    in_range: list[dict[str, Any]] = []
-    for s in seasons:
-        start = parse_dt(s.get("startDate"))
-        end = parse_dt(s.get("endDate"))
-        if start and end and start <= now <= end:
-            in_range.append(s)
-    if in_range:
-        # If several overlap, pick the one with the latest start.
-        in_range.sort(key=lambda s: s.get("startDate") or "", reverse=True)
-        return in_range[0]
+def pick_current_season(
+    seasons: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    season: str | None = None,
+) -> dict[str, Any]:
+    """
+    Deterministic season pick:
+      1. If `season` override is set, match by case-insensitive name substring / exact uid.
+      2. Else prefer seasons whose [startDate, endDate] contains `now` (UTC);
+         if several overlap, pick the latest startDate (stable tie-break by uid).
+      3. Else pick the season with the latest startDate (tie-break by uid).
+    """
     if not seasons:
         raise LeanApiError("No seasons returned by /nav/seasons/")
-    return max(seasons, key=lambda s: s.get("startDate") or "")
+
+    override = (season or "").strip()
+    if override:
+        needle = override.casefold()
+        hits = [
+            s
+            for s in seasons
+            if needle == str(s.get("uid") or "").casefold()
+            or needle == str(s.get("name") or "").casefold()
+            or needle in str(s.get("name") or "").casefold()
+        ]
+        if not hits:
+            names = ", ".join(str(s.get("name") or s.get("uid")) for s in seasons)
+            raise LeanApiError(
+                f'No season matched config season="{override}". Seasons: {names}.'
+            )
+        # Prefer exact name, then exact uid, then longest name match; stable by startDate desc.
+        def rank(s: dict[str, Any]) -> tuple:
+            name = str(s.get("name") or "")
+            uid = str(s.get("uid") or "")
+            exact_name = 0 if name.casefold() == needle else 1
+            exact_uid = 0 if uid.casefold() == needle else 1
+            return (exact_name, exact_uid, -(len(name)), str(s.get("startDate") or ""), uid)
+
+        hits.sort(key=rank)
+        return hits[0]
+
+    now = now or datetime.now(timezone.utc)
+    in_range: list[dict[str, Any]] = []
+    for s in seasons:
+        start = _parse_api_dt(s.get("startDate") if isinstance(s.get("startDate"), str) else None)
+        end = _parse_api_dt(s.get("endDate") if isinstance(s.get("endDate"), str) else None)
+        # Also accept datetime objects in tests.
+        if start is None and isinstance(s.get("startDate"), datetime):
+            start = s["startDate"]
+        if end is None and isinstance(s.get("endDate"), datetime):
+            end = s["endDate"]
+        if start and end and start <= now <= end:
+            in_range.append(s)
+
+    def sort_key(s: dict[str, Any]) -> tuple:
+        # Latest start first; stable uid tie-break.
+        return (str(s.get("startDate") or ""), str(s.get("uid") or ""))
+
+    pool = in_range if in_range else list(seasons)
+    pool.sort(key=sort_key, reverse=True)
+    return pool[0]
 
 
 def list_season_divisions(api_base: str, season_uid: str) -> list[dict[str, Any]]:
@@ -207,7 +291,7 @@ def _format_match_start(raw: str | None) -> tuple[str, str]:
     except ValueError:
         return (raw, "")
     local = dt.astimezone(_ET)
-    date_str = local.strftime("%a, %b ") + str(local.day)  # avoid zero-padded day
+    date_str = local.strftime("%a, %b ") + str(local.day)
     hour = local.strftime("%I").lstrip("0") or "0"
     minute = local.strftime("%M")
     ampm = local.strftime("%p").lower()
@@ -218,12 +302,13 @@ def _format_match_start(raw: str | None) -> tuple[str, str]:
 def _week_label(match: dict[str, Any]) -> str:
     inc_name = (match.get("incrementName") or "").strip()
     inc_num = match.get("incrementNumber")
-    inc_date = match.get("incrementDate")
     is_tourn = bool(match.get("isTournament"))
     date_part = ""
-    if inc_date:
+    if match.get("incrementDate"):
         try:
-            dt = datetime.fromisoformat(inc_date.replace("Z", "")).replace(tzinfo=timezone.utc)
+            dt = datetime.fromisoformat(str(match["incrementDate"]).replace("Z", "")).replace(
+                tzinfo=timezone.utc
+            )
             local = dt.astimezone(_ET)
             date_part = local.strftime("%b ") + str(local.day)
         except ValueError:
@@ -303,11 +388,3 @@ def games_for_teams(
             }
         )
     return games
-
-
-def levels_match_blob(levels: list[str], *parts: str) -> bool:
-    needles = [lv.strip().lower() for lv in levels if lv and str(lv).strip()]
-    if not needles:
-        return True
-    blob = " ".join(parts).lower()
-    return any(n in blob for n in needles)

@@ -37,6 +37,10 @@ siteUrl: "https://example.league.ninja"
 # Optional explicit pub API base (otherwise inferred for known clubs from siteUrl/leagueUrl).
 # apiBaseUrl: "https://example-lms-pub-api.league.ninja"
 
+# Optional: force a season by exact name or uid. When empty, pick the active
+# season by date (in-range preferred; else latest startDate).
+# season: "Summer III- 2026"
+
 # Game-day / league notes (single-division). Optional when levels[] is set.
 day: "Sunday"
 league: "Example Season › Example League › Example Division"
