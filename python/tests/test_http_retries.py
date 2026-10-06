@@ -1,4 +1,12 @@
-"""Tests: lean HTTP Retry-After, circuit breaker, partial JSON, protocol retries."""
+"""Tests: lean HTTP Retry-After, circuit breaker, partial JSON, protocol retries.
+
+Replaces the pre-#6 urllib-based suite with LeanHttpClient coverage:
+  - test_http_retries_protocol_and_os_errors_then_succeeds  →
+      test_retries_protocol_and_os_errors_then_succeeds (same four exceptions)
+  - test_http_exhausted_retries_become_lean_api_error →
+      test_exhausted_retries_become_lean_api_error (same four exceptions)
+Plus new robust-lean cases: Retry-After, partial JSON, circuit breaker.
+"""
 
 from __future__ import annotations
 
@@ -14,12 +22,25 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lean_http import (
+from lean_http import (  # noqa: E402
     CircuitOpenError,
     HttpSettings,
     LeanApiError,
     LeanHttpClient,
 )
+
+_PROTOCOL_EXCS = [
+    http.client.RemoteDisconnected("Remote end closed connection without response"),
+    http.client.IncompleteRead(b"partial"),
+    http.client.BadStatusLine("bad status"),
+    ConnectionResetError(104, "Connection reset by peer"),
+]
+_PROTOCOL_IDS = [
+    "RemoteDisconnected",
+    "IncompleteRead",
+    "BadStatusLine",
+    "ConnectionResetError",
+]
 
 
 def _json_bytes(obj) -> bytes:
@@ -31,19 +52,25 @@ def _ok_response(payload=None):
     resp.status = 200
     resp.reason = "OK"
     resp.headers = {}
-    resp.read.return_value = _json_bytes(payload if payload is not None else {"Data": {"ok": True}, "StatusCode": 200})
+    resp.read.return_value = _json_bytes(
+        payload if payload is not None else {"Data": {"ok": True}, "StatusCode": 200}
+    )
     return resp
 
 
-def test_retries_on_remote_disconnected_then_succeeds():
-    client = LeanHttpClient(HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10))
+@pytest.mark.parametrize("exc", _PROTOCOL_EXCS, ids=_PROTOCOL_IDS)
+def test_http_retries_protocol_and_os_errors_then_succeeds(exc):
+    """Successor to test_http_retries_protocol_and_os_errors_then_succeeds."""
+    client = LeanHttpClient(
+        HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10)
+    )
     conn = MagicMock()
     calls = {"n": 0}
 
     def request(*_a, **_k):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise http.client.RemoteDisconnected("bye")
+            raise exc
 
     conn.request.side_effect = request
     conn.getresponse.side_effect = lambda: _ok_response()
@@ -59,8 +86,28 @@ def test_retries_on_remote_disconnected_then_succeeds():
     assert client.stats.retries >= 1
 
 
+@pytest.mark.parametrize("exc", _PROTOCOL_EXCS, ids=_PROTOCOL_IDS)
+def test_http_exhausted_retries_become_lean_api_error(exc):
+    """Successor to test_http_exhausted_retries_become_lean_api_error."""
+    client = LeanHttpClient(
+        HttpSettings(max_retries=2, backoff_base_s=0.01, jitter_s=0, max_retries_total=10)
+    )
+    conn = MagicMock()
+    conn.request.side_effect = exc
+    conn.sock = MagicMock()
+
+    with (
+        patch.object(client, "_get_conn", return_value=conn),
+        patch("lean_http.time.sleep"),
+        pytest.raises(LeanApiError, match="after 2 attempt"),
+    ):
+        client.get_json("https://example.test/api")
+
+
 def test_honours_retry_after_on_429():
-    client = LeanHttpClient(HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10))
+    client = LeanHttpClient(
+        HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10)
+    )
     conn = MagicMock()
     calls = {"n": 0}
 
@@ -86,12 +133,13 @@ def test_honours_retry_after_on_429():
         data = client.get_json("https://example.test/api")
     assert data == [1]
     assert client.stats.retry_after_honored == 1
-    # First sleep arg should be Retry-After capped
     assert sleep.call_args_list[0].args[0] == 1.5
 
 
 def test_partial_json_is_retried():
-    client = LeanHttpClient(HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10))
+    client = LeanHttpClient(
+        HttpSettings(max_retries=3, backoff_base_s=0.01, jitter_s=0, max_retries_total=10)
+    )
     conn = MagicMock()
     calls = {"n": 0}
 

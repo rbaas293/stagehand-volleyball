@@ -71,3 +71,8 @@ http:
   circuitCooldownS: 20.0
   concurrency: 4         # parallel division fetches (bounded)
   # userAgent: "stagehand-volleyball/lean"
+
+# Optional: allow the xAI HTTP client to honor HTTP(S)_PROXY from the environment.
+# Leave false unless you intentionally route API traffic through a proxy.
+# httpTrustEnv: false
+
