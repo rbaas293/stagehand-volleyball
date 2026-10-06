@@ -38,9 +38,10 @@ siteUrl: "https://example.league.ninja"
 # apiBaseUrl: "https://example-lms-pub-api.league.ninja"
 
 # Optional season override (exact name, substring, or uid). When empty, auto-pick
-# prefers an in-range season that has divisions matching levels[] above — so a
-# newer empty overlap (e.g. Fall 2026 with no Beer A/B yet) does not win over
-# Summer III. Force a season if auto-pick is wrong:
+# prefers an in-range season that has *posted* data for levels[] (matching
+# divisions with teams). Seasons that exist but are not posted yet (no matching
+# divisions, or divisions with no teams) are skipped with reason "not posted yet"
+# and recorded in output seasonStatus.skipped. Force a season if needed:
 # season: "Summer III- 2026"
 
 # Game-day / league notes (single-division). Optional when levels[] is set.
@@ -56,3 +57,17 @@ model: "grok-4-fast-reasoning"
 
 # Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
 schedulePathSuffix: "/schedule"
+
+# Lean HTTP robustness (optional). Defaults shown.
+http:
+  connectTimeoutS: 5.0
+  readTimeoutS: 20.0
+  maxRetries: 4          # per-request attempts
+  maxRetriesTotal: 80    # retry budget for the whole run
+  backoffBaseS: 0.4
+  backoffMaxS: 10.0
+  jitterS: 0.3
+  circuitFailureThreshold: 5
+  circuitCooldownS: 20.0
+  concurrency: 4         # parallel division fetches (bounded)
+  # userAgent: "stagehand-volleyball/lean"

@@ -160,7 +160,7 @@ def test_pick_season_for_levels_skips_empty_fall_oct26():
         ]
 
     logs: list[str] = []
-    season, matched, reason = pick_season_for_levels(
+    season, matched, _reason, status = pick_season_for_levels(
         "https://api.example",
         seasons,
         levels,
@@ -170,8 +170,9 @@ def test_pick_season_for_levels_skips_empty_fall_oct26():
     )
     assert season["uid"] == "summer-uid"
     assert len(matched) == 2
-    assert "Fall" in reason or "skipped" in reason.lower()
-    assert any("Season pick" in m or "skipped" in m.lower() for m in logs) or "skipped" in reason.lower()
+    assert status["picked"]["uid"] == "summer-uid"
+    assert any(s["reason"] == "not posted yet" for s in status["skipped"])
+    assert status["skipped"][0]["name"] == "Fall 2026"
 
 
 def test_pick_season_for_levels_override_skips_fallback():
@@ -207,3 +208,47 @@ def test_pick_season_for_levels_override_skips_fallback():
             season="Fall 2026",
             list_divisions=fake_list,
         )
+
+
+def test_pick_season_skips_empty_standings_as_not_posted():
+    """Divisions matching levels but with no teams → not posted yet; fall back."""
+    from lean_api import pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "new-uid",
+            "name": "Fall 2026",
+            "startDate": "2026-10-25T16:00:00",
+            "endDate": "2027-01-15T00:00:00",
+        },
+        {
+            "uid": "summer-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+
+    def fake_list(_api: str, uid: str):
+        return [
+            {"divisionUid": f"{uid}-d1", "divisionName": "Sunday Beer (A)", "leagueName": "Beer A"},
+        ]
+
+    def fake_standings(_api: str, uid: str):
+        if uid.startswith("new-uid"):
+            return []  # no teams yet
+        return [{"teamName": "Him-Roids", "captainName": "R. Baas"}]
+
+    season, _matched, _reason, status = pick_season_for_levels(
+        "https://api.example",
+        seasons,
+        ["Beer A"],
+        now=now,
+        list_divisions=fake_list,
+        probe_standings=fake_standings,
+    )
+    assert season["uid"] == "summer-uid"
+    assert status["skipped"][0]["name"] == "Fall 2026"
+    assert status["skipped"][0]["reason"] == "not posted yet"
+    assert status["picked"]["name"] == "Summer III- 2026"
