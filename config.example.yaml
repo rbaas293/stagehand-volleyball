@@ -6,23 +6,35 @@
 # You must set at least one of captainName or teamName.
 # Keep string values in double quotes so characters like ":" or "#" are never misread.
 
-# Captain to search for on the standings page (preferred discovery path).
-# Case-insensitive; partial match OK ("Robinson" matches "H. Robinson").
-# Leave empty ("") or delete this line to use teamName instead.
-captainName: "H. Robinson"
+captainName:
+  - "H. Robinson"
+  - "Ryan Baas"
+  - "R. Baas"
+  - "R Baas"
 
-# Explicit team name. Used only when captainName is empty/absent.
 teamName: "Win or Lose We Booze"
 
-# Game-day label, stored in the output for convenience.
+# lean = pub-api HTTP (no LLM); llm = Stagehand extract. Override: SCRAPE_MODE=lean|llm
+mode: "lean"
+
+# Multi-division: every division whose league/division name contains any substring.
+levels:
+  - "Beer A"
+  - "Beer B"
+
+siteUrl: "https://flannagans.league.ninja"
+
+# Optional season override (exact name, substring, or uid). When empty, auto-pick
+# prefers an in-range season that has divisions matching levels[] above — so a
+# newer empty overlap (e.g. Fall 2026 with no Beer A/B yet) does not win over
+# Summer III. Force a season if auto-pick is wrong:
+# season: "Summer III- 2026"
+
 day: "Sunday"
+league: "Summer III- 2026 › Beer A / Beer B (all days)"
 
-# Human-readable league / division path for your own notes.
-league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
-
-# Division standings URL (the Standings tab). The schedule URL is built as
-# leagueUrl + schedulePathSuffix.
+# Single-division URL (back-compat when levels is empty); also helps infer apiBaseUrl.
 leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
 
-# Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
+model: "grok-4-fast-reasoning"
 schedulePathSuffix: "/schedule"
