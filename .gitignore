@@ -21,6 +21,14 @@ dist/
 build/
 *.pyz
 
+# Python packaging / CI (under python/)
+python/dist/
+python/build/
+python/*.egg-info/
+python/.ruff_cache/
+python/.pytest_cache/
+**/stagehand_volleyball.egg-info/
+
 # Browser leftovers
 chrome-user-data/
 

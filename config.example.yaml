@@ -56,3 +56,8 @@ model: "grok-4-fast-reasoning"
 
 # Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
 schedulePathSuffix: "/schedule"
+
+# Optional: allow the xAI HTTP client to honor HTTP(S)_PROXY from the environment.
+# Leave false unless you intentionally route API traffic through a proxy.
+# httpTrustEnv: false
+

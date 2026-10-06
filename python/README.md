@@ -23,3 +23,47 @@ python main.py                     # lean by default
 Config: prefers **`../config.yaml`**, falls back to `python/config.yaml`.
 Env: shell > `python/.env` > `../.env`.
 Output: `python/games.json` (gitignored).
+
+## Packaging (wheels / shiv)
+
+`pyproject.toml` packages `main.py`, `lean_api.py`, and `token_usage.py` with
+console script `stagehand-volleyball` (`main:main`). Dependencies stay in sync
+with `requirements.txt`.
+
+```bash
+cd python
+pip install -e ".[dev]"          # editable + ruff/pytest/build/shiv
+python -m build                  # wheels + sdist under dist/
+shiv -c stagehand-volleyball -o dist/shiv/stagehand-volleyball.pyz .
+pytest -q                        # unit + smoke (no live network)
+```
+
+GitHub Actions (`.github/workflows/python-ci.yml`) gates on scraper PR #1 being
+merged, then runs checks (3.11/3.12), wheel builds, and shiv binaries.
+
+## Config file location (wheels / shiv)
+
+`stagehand-volleyball` (and `python main.py`) resolve config in order:
+
+1. `--config PATH`
+2. `$STAGEHAND_VOLLEYBALL_CONFIG`
+3. `./config.yaml` (cwd)
+4. Repo-root / `python/config.yaml` only for source checkouts
+
+```bash
+stagehand-volleyball --help
+stagehand-volleyball --config /path/to/config.yaml --check-config
+stagehand-volleyball --config config.yaml          # full scrape
+```
+
+Packaged installs never read `site-packages/config.yaml`. Put `config.yaml` in
+the directory you run from, or pass `--config` / `$STAGEHAND_VOLLEYBALL_CONFIG`.
+Use `--env-file` for allow-listed secrets (cwd `.env` is not auto-loaded).
+Optional config key `httpTrustEnv` (default false) controls whether the xAI
+HTTP client honors proxy environment variables.
+
+## Output writes
+
+`games.json` is written atomically (temp file + replace). The tool refuses to
+write through a symlink at the output path.
+
