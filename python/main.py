@@ -44,7 +44,9 @@ import asyncio  # Stagehand's Python API is async; we drive it with asyncio.run(
 import json  # Serialize games.json (and the team-name list passed to the page)
 import os  # Read env vars (XAI_API_KEY, HEADLESS, …)
 import re  # Match week-tab labels (Week / TOURNAMENT / …)
-import sys  # Exit codes + stderr logging
+import sys
+import tempfile
+import stat  # lstat / symlink checks for atomic output writes
 from datetime import datetime, timezone  # scrapedAt timestamp (UTC ISO-8601)
 from pathlib import Path  # Config / output paths without string concat
 from typing import Any, Literal  # Typing for status enum + loose YAML/JSON bits
@@ -53,6 +55,7 @@ from urllib.parse import urlparse  # Validate leagueUrl is a real http(s) URL
 # ---- Third-party ------------------------------------------------------------
 import yaml  # PyYAML: parse config.yaml (safe_load only — plain data, never arbitrary objects)
 from openai import AsyncOpenAI
+import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local_browser
 
@@ -118,26 +121,37 @@ def resolve_config_path(cli_path: str | Path | None = None) -> Path:
     """
     Locate config.yaml for both source checkouts and installed wheel/shiv runs.
 
-    Precedence (first existing file wins):
-      1. --config PATH (CLI)
-      2. $STAGEHAND_VOLLEYBALL_CONFIG
+    Precedence:
+      1. --config PATH (CLI) — must exist; missing path is a hard error
+      2. $STAGEHAND_VOLLEYBALL_CONFIG — must exist; missing path is a hard error
       3. ./config.yaml in the process cwd
       4. Repo-root ../config.yaml / python/config.yaml — only when running from
          a source checkout (pyproject.toml or requirements.txt beside this file)
 
-    Raises ConfigError listing every path tried when none exist.
+    Explicit --config / env paths never fall through to cwd. Raises ConfigError
+    listing every path tried when no automatic candidate exists.
     """
-    tried: list[Path] = []
-    candidates: list[Path] = []
-
+    # Explicit CLI path: require the file; do not silently use cwd instead.
     if cli_path is not None:
-        candidates.append(Path(cli_path).expanduser())
+        path = Path(cli_path).expanduser()
+        if not path.is_file():
+            raise ConfigError(
+                f"Config file from --config not found: {path}"
+            )
+        return path
 
+    # Explicit env path: same hard-fail rule.
     env_path = (os.environ.get(CONFIG_ENV_VAR) or "").strip()
     if env_path:
-        candidates.append(Path(env_path).expanduser())
+        path = Path(env_path).expanduser()
+        if not path.is_file():
+            raise ConfigError(
+                f"Config file from ${CONFIG_ENV_VAR} not found: {path}"
+            )
+        return path
 
-    candidates.append(Path.cwd() / "config.yaml")
+    tried: list[Path] = []
+    candidates: list[Path] = [Path.cwd() / "config.yaml"]
 
     if _RUNNING_FROM_SOURCE:
         # Repo root first (shared), then optional python/ override.
@@ -255,6 +269,9 @@ class AppConfig(BaseModel):
     # When empty, pick an in-range season that has divisions matching levels[]
     # (skips empty overlaps like Fall before Beer leagues exist).
     season: str = Field(default="")
+    # When true, the xAI HTTP client honors env proxy settings (HTTP(S)_PROXY).
+    # Default false so a poisoned proxy env cannot intercept API traffic.
+    http_trust_env: bool = Field(default=False, alias="httpTrustEnv")
 
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
@@ -339,37 +356,37 @@ class AppConfig(BaseModel):
         return self
 
 
-def load_dotenv_files() -> None:
-    """
-    Optionally load .env files into os.environ. Keeps secrets out of the repo;
-    .env is gitignored.
+# Env keys we will accept from .env files (shell exports always win and are unrestricted).
+ALLOWED_ENV_KEYS = frozenset(
+    {
+        "XAI_API_KEY",
+        "BROWSERBASE_API_KEY",
+        "STAGEHAND_MODEL",
+        "SCRAPE_MODE",
+        "SCRAPE_LLM_PREFILTER",
+        "HEADLESS",
+        CONFIG_ENV_VAR,
+    }
+)
+ALLOWED_ENV_PREFIXES = ("BROWSERBASE_",)
 
-    Precedence (highest first): shell exports > ./.env (cwd) > python/.env >
-    ../.env (repo root, source checkout only). First file to set a key wins
-    (override=False); later files only fill gaps. Cwd is included so wheel/shiv
-    installs pick up a local .env next to where you run the binary.
-    """
-    # Try python-dotenv if installed; otherwise do a tiny manual parser so the
-    # scraper still works without python-dotenv (only stagehand + PyYAML needed).
-    candidates = [Path.cwd() / ".env"]
-    if _RUNNING_FROM_SOURCE:
-        candidates.extend([ROOT / ".env", ROOT.parent / ".env"])
-    candidates = _unique_paths(candidates)
+
+def _env_key_allowed(key: str) -> bool:
+    """True if key is on the allow-list (exact or BROWSERBASE_* prefix)."""
+    if key in ALLOWED_ENV_KEYS:
+        return True
+    return any(key.startswith(prefix) for prefix in ALLOWED_ENV_PREFIXES)
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE pairs from a .env file (no shell expansion)."""
     try:
-        from dotenv import load_dotenv  # type: ignore
+        from dotenv import dotenv_values  # type: ignore
 
-        for path in candidates:
-            if path.is_file():
-                # override=False: shell exports (and earlier files) win.
-                load_dotenv(path, override=False)
-        return
+        raw = dotenv_values(path)
+        return {k: v for k, v in raw.items() if k and v is not None}
     except ImportError:
-        pass
-
-    # Manual fallback: KEY=VALUE lines, ignore comments / blanks.
-    for path in candidates:
-        if not path.is_file():
-            continue
+        out: dict[str, str] = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -377,9 +394,42 @@ def load_dotenv_files() -> None:
             key, _, value = stripped.partition("=")
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            # Never clobber an env var the user exported or an earlier file set.
-            if key and key not in os.environ:
+            if key:
+                out[key] = value
+        return out
+
+
+def load_dotenv_files(env_file: str | Path | None = None) -> None:
+    """
+    Optionally load allow-listed keys from .env into os.environ.
+
+    Sources (never auto-loads cwd `.env` for packaged installs):
+      - `--env-file PATH` when provided (must exist)
+      - `python/.env` then repo-root `../.env` when running from a source checkout
+
+    Shell exports always win. Only known keys are applied from files
+    (XAI_API_KEY, STAGEHAND_MODEL, SCRAPE_MODE, HEADLESS, BROWSERBASE_*, …).
+    """
+    candidates: list[Path] = []
+    if env_file is not None:
+        path = Path(env_file).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"Env file from --env-file not found: {path}")
+        candidates.append(path)
+    elif _RUNNING_FROM_SOURCE:
+        candidates.extend([ROOT / ".env", ROOT.parent / ".env"])
+
+    for path in _unique_paths(candidates):
+        if not path.is_file():
+            continue
+        parsed = _parse_env_file(path)
+        for key, value in parsed.items():
+            if not _env_key_allowed(key):
+                continue
+            # Never clobber an env var the user already exported or an earlier file set.
+            if key not in os.environ:
                 os.environ[key] = value
+
 
 
 def load_config(cli_path: str | Path | None = None) -> AppConfig:
@@ -662,7 +712,7 @@ def resolve_grok_model_id(config_model: str | None = None) -> str:
     return raw
 
 
-def make_grok_generate(api_key: str, model_id: str):
+def make_grok_generate(api_key: str, model_id: str, *, trust_env: bool = False):
     """
     Build a Stagehand BYO LLM callback that calls xAI Grok.
 
@@ -670,8 +720,12 @@ def make_grok_generate(api_key: str, model_id: str):
     cerebras. xAI is reached via the documented OpenAI-compatible BYO callback
     pointed at https://api.x.ai/v1 (XAI_API_KEY). See Stagehand v4 models docs
     ("bring your own LLM" / "OpenAI-compatible SDKs") and docs.x.ai.
+
+    trust_env=False (default) ignores HTTP(S)_PROXY from the environment unless
+    the user sets httpTrustEnv: true in config.yaml.
     """
-    client = AsyncOpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+    http_client = httpx.AsyncClient(trust_env=trust_env)
+    client = AsyncOpenAI(api_key=api_key, base_url=XAI_BASE_URL, http_client=http_client)
 
     def content_part(block: Any) -> dict[str, Any]:
         # Each block is LLMTextContent or LLMImageContent under `.root`.
@@ -725,7 +779,9 @@ def make_grok_generate(api_key: str, model_id: str):
     return generate_with_grok
 
 
-def model_kwargs(config_model: str | None = None) -> dict[str, Any]:
+def model_kwargs(
+    config_model: str | None = None, *, trust_env: bool = False
+) -> dict[str, Any]:
     """
     Build Stagehand.create() kwargs for the LLM.
 
@@ -737,7 +793,7 @@ def model_kwargs(config_model: str | None = None) -> dict[str, Any]:
         model_id = resolve_grok_model_id(config_model)
         log(f'LLM: xAI Grok model="{model_id}" via {XAI_BASE_URL}')
         # Pass the generate callback as `model=` (Stagehand BYO LLM path).
-        return {"model": make_grok_generate(api_key, model_id)}
+        return {"model": make_grok_generate(api_key, model_id, trust_env=trust_env)}
     if os.environ.get("BROWSERBASE_API_KEY"):
         # Omit model — Browserbase Model Gateway picks one.
         return {}
@@ -1461,7 +1517,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
     else:
         log(f'Config: mode=llm team="{config_team_name}" levels={config.levels!r} model={model_id!r}')
 
-    create_kwargs = model_kwargs(config.model)
+    create_kwargs = model_kwargs(config.model, trust_env=config.http_trust_env)
     season_name, divisions = discover_target_divisions(config)
 
     suffix = config.schedule_path_suffix
@@ -1668,7 +1724,10 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
         await browser.close()
 
 
-async def scrape(cli_config: str | Path | None = None) -> dict[str, Any]:
+async def scrape(
+    cli_config: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> dict[str, Any]:
     """
     End-to-end scrape. Returns the output dict that we also write to games.json.
 
@@ -1676,8 +1735,9 @@ async def scrape(cli_config: str | Path | None = None) -> dict[str, Any]:
     mode=llm  → Stagehand extract (browser + Grok BYO callback)
     Override mode with env SCRAPE_MODE=lean|llm.
     cli_config is an optional --config PATH from the CLI.
+    env_file is an optional --env-file PATH from the CLI.
     """
-    load_dotenv_files()
+    load_dotenv_files(env_file)
     config = load_config(cli_config)
     mode = (os.environ.get("SCRAPE_MODE") or config.mode or "lean").strip().lower()
     if mode not in ("lean", "llm"):
@@ -1691,6 +1751,47 @@ async def scrape(cli_config: str | Path | None = None) -> dict[str, Any]:
     if config.mode == "lean":
         return scrape_lean(config)
     return await scrape_llm(config)
+
+
+
+def write_output_atomic(target: Path, text: str) -> None:
+    """
+    Write games.json atomically and refuse to follow a symlink at the target.
+
+    Creates a temp file in the same directory, then os.replace(). If `target`
+    already exists as a symlink, raise ConfigError instead of writing through it.
+    """
+    target = Path(target)
+    parent = target.parent if str(target.parent) else Path.cwd()
+    parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        st = os.lstat(target)
+        if stat.S_ISLNK(st.st_mode):
+            raise ConfigError(
+                f"Refusing to write output through symlink: {target}"
+            )
+    except FileNotFoundError:
+        pass
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def parse_args(argv: list[str] | None = None) -> Any:
@@ -1712,6 +1813,15 @@ def parse_args(argv: list[str] | None = None) -> Any:
         help="Path to config.yaml (overrides env and cwd lookup)",
     )
     parser.add_argument(
+        "--env-file",
+        metavar="PATH",
+        help=(
+            "Optional .env file to load (allow-listed keys only). "
+            "Cwd .env is not auto-loaded; source checkouts still load python/.env "
+            "and repo-root .env when this flag is omitted."
+        ),
+    )
+    parser.add_argument(
         "--check-config",
         action="store_true",
         help=(
@@ -1722,15 +1832,18 @@ def parse_args(argv: list[str] | None = None) -> Any:
     return parser.parse_args(argv)
 
 
-async def async_main(cli_config: str | Path | None = None) -> None:
+async def async_main(
+    cli_config: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> None:
     """Run scrape(), print JSON to stdout, write games.json."""
     global OUTPUT_PATH
     # Recompute each run so packaged binaries write into the caller's cwd.
     OUTPUT_PATH = (ROOT / "games.json") if _RUNNING_FROM_SOURCE else (Path.cwd() / "games.json")
-    output = omit_nulls(await scrape(cli_config))
+    output = omit_nulls(await scrape(cli_config, env_file))
     json_text = json.dumps(output, indent=2)
     print(json_text)
-    OUTPUT_PATH.write_text(json_text + "\n", encoding="utf-8")
+    write_output_atomic(OUTPUT_PATH, json_text + "\n")
     n_games = len(output.get("games") or [])
     n_teams = len(output.get("matchedTeams") or [])
     log(f"Wrote {n_games} games for {n_teams} team(s) to {OUTPUT_PATH}")
@@ -1741,14 +1854,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         args = parse_args(argv)
         if args.check_config:
-            load_dotenv_files()
+            load_dotenv_files(args.env_file)
             config = load_config(args.config)
             print(f"config: {CONFIG_PATH}")
             print(f"mode: {config.mode}")
             print(f"captainName: {config.captain_name!r}")
             print(f"teamName: {config.team_name!r}")
             return
-        asyncio.run(async_main(args.config))
+        asyncio.run(async_main(args.config, args.env_file))
     except (ConfigError, MissingKeyError, ResolveError, WeekTabError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.

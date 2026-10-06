@@ -37,6 +37,14 @@ The scraper code stays under **`python/`** (not moved to repo root) so existing 
 
 ## Config file location
 
+Env files are **not** auto-loaded from the cwd for installed binaries. Use
+`--env-file PATH`, or rely on `python/.env` / repo-root `.env` in a source
+checkout. Only known keys are imported from those files. Set `httpTrustEnv: true`
+in config.yaml only if you intentionally want the xAI client to honor proxy env
+vars.
+
+
+
 The scraper resolves `config.yaml` in this order:
 
 1. `--config PATH` on the CLI

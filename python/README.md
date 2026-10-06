@@ -56,6 +56,14 @@ stagehand-volleyball --config /path/to/config.yaml --check-config
 stagehand-volleyball --config config.yaml          # full scrape
 ```
 
-Packaged installs never read `site-packages/config.yaml`. Put `config.yaml` and
-optional `.env` in the directory you run from, or pass `--config`.
+Packaged installs never read `site-packages/config.yaml`. Put `config.yaml` in
+the directory you run from, or pass `--config` / `$STAGEHAND_VOLLEYBALL_CONFIG`.
+Use `--env-file` for allow-listed secrets (cwd `.env` is not auto-loaded).
+Optional config key `httpTrustEnv` (default false) controls whether the xAI
+HTTP client honors proxy environment variables.
+
+## Output writes
+
+`games.json` is written atomically (temp file + replace). The tool refuses to
+write through a symlink at the output path.
 
