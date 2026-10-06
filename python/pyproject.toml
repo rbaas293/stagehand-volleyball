@@ -11,14 +11,18 @@ name = "stagehand-volleyball"
 version = "0.1.0"
 description = "Stagehand v4 Python scraper for league.ninja volleyball schedules"
 readme = "README.md"
-requires-python = ">=3.10"
+# Stagehand + README require 3.11+ (stack tip after #4/#5).
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Ryan Baas" }]
 dependencies = [
     # Keep in sync with requirements.txt (pip -r still works for non-packaged runs).
     "stagehand==4.1.0",
     "pydantic>=2.0,<3",
+    "PyYAML>=6.0,<7",
     "python-dotenv>=1.0,<2",
+    # OpenAI-compatible client for xAI Grok (Stagehand BYO LLM callback).
+    "openai>=1.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -36,8 +40,8 @@ dev = [
 stagehand-volleyball = "main:main"
 
 [tool.setuptools]
-# Flat layout: keep main.py importable as `import main` (no package rename).
-py-modules = ["main"]
+# Flat layout: keep modules importable as `import main` / lean_api / token_usage.
+py-modules = ["main", "lean_api", "token_usage"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,5 +59,4 @@ select = ["E", "F", "I", "W", "UP"]
 ignore = [
     "E501",  # line length: long comment lines are intentional in this codebase
     "I001",  # isort: keep hand-aligned import comments in main.py
-    "UP017", # datetime.UTC needs 3.11+; we still support 3.10 via timezone.utc
 ]

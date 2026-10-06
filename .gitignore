@@ -1,20 +1,50 @@
-node_modules/
+# Secrets / local env (keep .env.example)
 .env
 .env.*
 !.env.example
+
+# Scraper output
 games.json
-chrome-user-data/
+python/games.json
+
 # Python
 python/.venv/
 python/venv/
+.venv/
+venv/
 **/__pycache__/
 *.py[cod]
-python/games.json
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.pyz
 
-# Python packaging / CI
+# Python packaging / CI (under python/)
 python/dist/
 python/build/
 python/*.egg-info/
 python/.ruff_cache/
 python/.pytest_cache/
 **/stagehand_volleyball.egg-info/
+
+# Browser leftovers
+chrome-user-data/
+
+# Stale JSON config (migrated to YAML)
+config.json
+config.example.json
+python/config.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Leftover local Node installs (TS removed)
+node_modules/
+
+# Local scraper config (copy from config.example.yaml). Do not commit personal names/URLs.
+config.yaml
+python/config.yaml

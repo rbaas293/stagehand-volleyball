@@ -1,0 +1,58 @@
+# stagehand-volleyball config template.
+#
+# Copy to a local (gitignored) config.yaml and edit:
+#   cp config.example.yaml config.yaml
+#
+# You must set at least one of captainName or teamName.
+# Keep string values in double quotes so characters like ":" or "#" are never misread.
+
+# Captain(s) to search for on the standings page (preferred discovery path).
+# Accepts a single string OR a YAML list. Case- and punctuation-insensitive
+# partial match ("Smith" matches "J. Smith"; "R Baas" matches "R. Baas").
+#
+# Single-string form (still supported):
+#   captainName: "J. Smith"
+captainName:
+  - "J. Smith"
+
+# Explicit team name. Used only when captainName is empty/absent.
+teamName: "Example Team"
+
+# Scraping mode:
+#   lean — club pub API (HTTP) for division list / standings / schedules (no LLM)
+#   llm  — Stagehand LLM extract on standings + each schedule week
+# Override at runtime with SCRAPE_MODE=lean|llm.
+mode: "lean"
+
+# Multi-division filter: scrape every division whose league/division name contains
+# any of these substrings (case-insensitive), for the current season.
+# When non-empty, leagueUrl is optional.
+levels:
+  - "Beer A"
+  - "Beer B"
+
+# Club site origin (used to build division URLs and infer the pub API host).
+siteUrl: "https://example.league.ninja"
+
+# Optional explicit pub API base (otherwise inferred for known clubs from siteUrl/leagueUrl).
+# apiBaseUrl: "https://example-lms-pub-api.league.ninja"
+
+# Optional season override (exact name, substring, or uid). When empty, auto-pick
+# prefers an in-range season that has divisions matching levels[] above — so a
+# newer empty overlap (e.g. Fall 2026 with no Beer A/B yet) does not win over
+# Summer III. Force a season if auto-pick is wrong:
+# season: "Summer III- 2026"
+
+# Game-day / league notes (single-division). Optional when levels[] is set.
+day: "Sunday"
+league: "Example Season › Example League › Example Division"
+
+# Single-division standings URL (backward compatible when levels is empty).
+# Also helps infer apiBaseUrl when siteUrl is omitted.
+leagueUrl: "https://example.league.ninja/leagues/division/00000000-0000-0000-0000-000000000000"
+
+# xAI Grok model id for Stagehand extract/act (llm mode). Override with STAGEHAND_MODEL.
+model: "grok-4-fast-reasoning"
+
+# Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
+schedulePathSuffix: "/schedule"

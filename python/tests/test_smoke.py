@@ -1,53 +1,74 @@
 """
-Smoke tests for the Python scraper packaging surface.
+Smoke tests for packaging and config loading (no live network / browser).
 
-These do not launch a browser or call Stagehand's LLM APIs. They only check that:
-  - the main module imports cleanly (packaging / install wiring),
-  - config.json at the repo root loads and validates,
-  - AppConfig rejects empty captain+team the same way as production.
+These check that:
+  - the main module (and helpers) import cleanly after install,
+  - config.example.yaml at the repo root parses and validates (config.yaml is
+    gitignored and not present in CI),
+  - AppConfig accepts captainName as a string or list, and rejects empty ones.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 # Repo root = parent of python/ (this file lives in python/tests/).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON_DIR = Path(__file__).resolve().parents[1]
+EXAMPLE_CONFIG = REPO_ROOT / "config.example.yaml"
 
 
 def test_main_module_imports() -> None:
     """Console-script target `main:main` must be importable after install."""
+    import lean_api
     import main
+    import token_usage
 
     assert callable(main.main)
     assert callable(main.load_config)
     assert hasattr(main, "AppConfig")
+    assert hasattr(lean_api, "_http_get_json")
+    assert hasattr(token_usage, "USAGE")
 
 
-def test_load_config_from_repo_root() -> None:
-    """Shared ../config.json (preferred path) must validate into AppConfig."""
+def test_load_config_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Shared config.example.yaml must validate into AppConfig.
+
+    Production load_config() only reads config.yaml (gitignored). In CI we
+    point CONFIG_PATH at the tracked example so packaging still verifies the
+    real loader path without committing personal config.
+    """
     import main
 
-    config_path = REPO_ROOT / "config.json"
-    assert config_path.is_file(), f"expected shared config at {config_path}"
+    assert EXAMPLE_CONFIG.is_file(), f"expected example config at {EXAMPLE_CONFIG}"
+    monkeypatch.setattr(main, "CONFIG_PATH", EXAMPLE_CONFIG)
 
-    # load_config() resolves PARENT_CONFIG when that file exists.
     cfg = main.load_config()
-    assert cfg.day
-    assert cfg.league
-    assert cfg.league_url.startswith("http")
-    # At least one of captain/team is required by the model validator.
-    assert cfg.captain_name.strip() or cfg.team_name.strip()
+    assert isinstance(cfg.captain_name, list)
+    assert any(name.strip() for name in cfg.captain_name) or cfg.team_name.strip()
+    assert cfg.mode in ("lean", "llm")
+    # Example should have levels and/or a leagueUrl so the target validator passes.
+    assert cfg.levels or cfg.league_url.startswith("http")
 
 
 def test_app_config_requires_captain_or_team() -> None:
-    """Empty captainName + teamName must fail validation (mirrors TS superRefine)."""
+    """Empty captainName + teamName must fail validation."""
     import main
+
+    with pytest.raises(ValidationError):
+        main.AppConfig.model_validate(
+            {
+                "captainName": [],
+                "teamName": "",
+                "day": "Sunday",
+                "league": "Test League",
+                "leagueUrl": "https://example.com/division/1",
+            }
+        )
 
     with pytest.raises(ValidationError):
         main.AppConfig.model_validate(
@@ -62,10 +83,10 @@ def test_app_config_requires_captain_or_team() -> None:
 
 
 def test_app_config_accepts_camel_case_aliases() -> None:
-    """JSON uses camelCase; pydantic aliases must still populate snake_case attrs."""
+    """YAML uses camelCase; string or list captainName coerce to list[str]."""
     import main
 
-    cfg = main.AppConfig.model_validate(
+    as_string = main.AppConfig.model_validate(
         {
             "captainName": "H. Robinson",
             "teamName": "",
@@ -75,14 +96,25 @@ def test_app_config_accepts_camel_case_aliases() -> None:
             "schedulePathSuffix": "/schedule",
         }
     )
-    assert cfg.captain_name == "H. Robinson"
-    assert cfg.league_url.endswith("/1")
-    assert cfg.schedule_path_suffix == "/schedule"
+    assert as_string.captain_name == ["H. Robinson"]
+    assert as_string.league_url.endswith("/1")
+    assert as_string.schedule_path_suffix == "/schedule"
+
+    as_list = main.AppConfig.model_validate(
+        {
+            "captainName": ["H. Robinson", "R. Baas"],
+            "teamName": "",
+            "day": "Sunday",
+            "league": "Test League",
+            "leagueUrl": "https://example.com/division/1",
+        }
+    )
+    assert as_list.captain_name == ["H. Robinson", "R. Baas"]
 
 
-def test_config_json_is_valid_json() -> None:
-    """Sanity: repo-root config.json parses (same file CI artifacts assume)."""
-    raw = (REPO_ROOT / "config.json").read_text(encoding="utf-8")
-    data = json.loads(raw)
+def test_config_example_yaml_is_valid_yaml() -> None:
+    """Sanity: tracked config.example.yaml parses as a mapping."""
+    raw = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
     assert isinstance(data, dict)
-    assert "leagueUrl" in data
+    assert "captainName" in data or "teamName" in data
