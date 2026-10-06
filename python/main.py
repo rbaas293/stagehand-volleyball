@@ -16,14 +16,15 @@ Flow (llm):
 Run (from this folder):
   python3 -m venv .venv && source .venv/bin/activate
   pip install -r requirements.txt
-  export XAI_API_KEY=...   # or put it in ../.env / .env
-  python main.py
+  python main.py                 # lean by default
+  SCRAPE_MODE=llm python main.py # needs XAI_API_KEY (or ../.env / .env)
 
 Env:
-  XAI_API_KEY          required for local-Chrome mode (Grok via BYO LLM callback)
+  XAI_API_KEY          required for llm mode (Grok via BYO LLM callback)
   BROWSERBASE_API_KEY  optional: run in a Browserbase cloud browser instead
   STAGEHAND_MODEL      optional, overrides config.yaml model (default "grok-4-fast-reasoning")
-  HEADLESS=false       optional: show the local Chrome window
+  SCRAPE_MODE          optional, overrides config.mode (lean|llm)
+  HEADLESS=false       optional: show the local Chrome window (llm mode)
 
 Config resolution:
   - If captainName is set (non-empty), discover team(s) on the standings page whose
@@ -58,6 +59,7 @@ from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local
 # ---- Local helpers (lean HTTP API + LLM token accounting) -------------------
 from lean_api import (
     LeanApiError,
+    division_url as lean_division_url,
     filter_divisions_by_levels,
     games_for_teams,
     get_schedule_v2,
@@ -68,9 +70,6 @@ from lean_api import (
     pick_current_season,
     standing_row_from_api,
 )
-from lean_api import (
-    division_url as lean_division_url,
-)
 from token_usage import USAGE, reset_usage
 
 # ---------------------------------------------------------------------------
@@ -79,18 +78,17 @@ from token_usage import USAGE, reset_usage
 # Directory that contains this script (python/).
 ROOT = Path(__file__).resolve().parent
 
-# Prefer the shared repo-root config so one config.yaml drives both TS and Python.
-# Fall back to python/config.yaml if someone wants a Python-only override.
+# Prefer the shared repo-root config.yaml; fall back to python/config.yaml.
 PARENT_CONFIG = ROOT.parent / "config.yaml"
 LOCAL_CONFIG = ROOT / "config.yaml"
 CONFIG_PATH = PARENT_CONFIG if PARENT_CONFIG.is_file() else LOCAL_CONFIG
 
-# Output lands next to this script so TS games.json and Python games.json don't clash.
+# Output lands next to this script (python/games.json).
 OUTPUT_PATH = ROOT / "games.json"
 
 
 # ---------------------------------------------------------------------------
-# Errors 
+# Errors
 # ---------------------------------------------------------------------------
 class ConfigError(Exception):
     """Raised when config.yaml is missing, unreadable, not valid YAML, or fails validation."""
@@ -325,7 +323,7 @@ def load_config() -> AppConfig:
     try:
         return AppConfig.model_validate(parsed)
     except ValidationError as err:
-        # Flatten pydantic errors into one readable line (like the TS zod issues join).
+        # Flatten pydantic errors into one readable line.
         details = "; ".join(
             f"{'.'.join(str(p) for p in e.get('loc', ())) or '(root)'}: {e.get('msg')}"
             for e in err.errors()
@@ -337,7 +335,7 @@ def load_config() -> AppConfig:
 
 
 # ---------------------------------------------------------------------------
-# Extract schemas (pydantic = Zod equivalent for Stagehand extract())
+# Extract schemas (pydantic models for Stagehand extract())
 # ---------------------------------------------------------------------------
 class Game(BaseModel):
     """One match card involving a matched team."""
@@ -427,7 +425,7 @@ class Standings(BaseModel):
 def games_schema_for(team_names: list[str]) -> type[BaseModel]:
     """
     Build a Games-like pydantic model whose Field description names the matched
-    teams (helps the LLM filter schedule cards the same way the TS zod schema does).
+    teams (helps the LLM filter schedule cards to our matched teams).
     """
     # Quote each team so the description reads: "Win or Lose We Booze" or "Other"
     listed = " or ".join(f'"{t}"' for t in team_names)
@@ -455,7 +453,7 @@ def normalize_captain(s: str) -> str:
 
 def captain_matches(row_captain: str | None, wanted: str) -> bool:
     """
-    Case- and punctuation-insensitive partial match (case- and punctuation-insensitive).
+    Case- and punctuation-insensitive partial match.
     "Robinson" matches "H. Robinson"; "R Baas" matches "R. Baas".
     """
     if not row_captain or not wanted:
@@ -551,7 +549,7 @@ def try_resolve_teams_from_standings(
 # Logging / browser setup
 # ---------------------------------------------------------------------------
 def log(msg: str) -> None:
-    """Print progress to stderr so stdout stays clean JSON (same as TS)."""
+    """Print progress to stderr so stdout stays clean JSON."""
     print(f"[stagehand-volleyball] {msg}", file=sys.stderr)
 
 
@@ -686,20 +684,26 @@ _WEEK_TAB_RE = re.compile(r"LEAGUE ROUND|TOURNAMENT|PLAYOFF|Week", re.IGNORECASE
 
 async def list_week_tab_labels(page) -> list[str]:
     """
-    Read every role=tab under role=tablist and keep week / tournament labels.
+    Read week / tournament tabs from the *week* tablist only (not Standings/Schedule).
 
     Python Stagehand's page.evaluate() takes a JS *expression string* (no
     extra args), so the selector logic lives entirely inside the expression.
     """
-    # evaluate returns JSON-serializable values; we ask for a string array.
     raw = await page.evaluate(
         """(() => {
-          return Array.from(document.querySelectorAll('[role=tablist] [role=tab]'))
+          const isWeek = (t) => /LEAGUE ROUND|TOURNAMENT|PLAYOFF|Week/i.test(t);
+          const lists = Array.from(document.querySelectorAll('[role=tablist]'));
+          const weekList = lists.find((list) =>
+            Array.from(list.querySelectorAll('[role=tab]')).some((el) =>
+              isWeek(el.innerText)
+            )
+          );
+          if (!weekList) return [];
+          return Array.from(weekList.querySelectorAll('[role=tab]'))
             .map((el) => el.innerText.replace(/\\s*\\n\\s*/g, ' ').trim())
-            .filter((t) => /LEAGUE ROUND|TOURNAMENT|PLAYOFF|Week/i.test(t));
+            .filter((t) => isWeek(t));
         })()"""
     )
-    # Defensive: coerce whatever came back into a clean list[str].
     if not isinstance(raw, list):
         return []
     return [str(t) for t in raw if isinstance(t, str) and _WEEK_TAB_RE.search(t)]
@@ -709,47 +713,79 @@ def normalize_tab_label(text: str) -> str:
     """
     Canonical form for comparing tab labels: collapse every run of whitespace
     (spaces, newlines, tabs) to one space, trim, and casefold. So
-    "Week 5\n- Oct 4" and "week 5 - oct 4" compare equal.
+    "Week 5\\n- Oct 4" and "week 5 - oct 4" compare equal.
     """
     return " ".join(str(text).split()).casefold()
 
 
 async def click_tab_by_exact_text(page, label: str) -> bool:
     """
-    Deterministic click, deterministic DOM click: find the role=tab
-    whose whitespace-normalized innerText equals `label` and click() it.
+    Deterministic DOM click: find the week-tablist role=tab whose
+    whitespace-normalized innerText equals `label` and click() it.
 
-    Returns True if a matching tab element was found (and clicked), else False.
+    Returns True if a single matching tab was found (and clicked).
+    Raises WeekTabError if multiple tabs match and none is an exact
+    (non-normalized) unique hit. Returns False if no tab matches.
     No LLM call, so it's fast and can't pick a "similar-looking" tab.
     """
-    # json.dumps gives a safely quoted JS string literal for the label.
     label_js = json.dumps(label)
-    found = await page.evaluate(
+    result = await page.evaluate(
         f"""(() => {{
           const wanted = {label_js};
           const norm = (t) => t.replace(/\\s+/g, ' ').trim().toLowerCase();
-          const tab = Array.from(document.querySelectorAll('[role=tablist] [role=tab]'))
-            .find((el) => norm(el.innerText) === norm(wanted));
-          if (!tab) return false;
-          tab.click();
-          return true;
+          const exact = (t) => t.replace(/\\s+/g, ' ').trim();
+          const isWeek = (t) => /LEAGUE ROUND|TOURNAMENT|PLAYOFF|Week/i.test(t);
+          const lists = Array.from(document.querySelectorAll('[role=tablist]'));
+          const weekList = lists.find((list) =>
+            Array.from(list.querySelectorAll('[role=tab]')).some((el) =>
+              isWeek(el.innerText)
+            )
+          );
+          if (!weekList) return {{ status: 'not_found' }};
+          const tabs = Array.from(weekList.querySelectorAll('[role=tab]'));
+          const matches = tabs.filter((el) => norm(el.innerText) === norm(wanted));
+          if (matches.length === 0) return {{ status: 'not_found' }};
+          if (matches.length > 1) {{
+            const exactHits = matches.filter((el) => exact(el.innerText) === exact(wanted));
+            if (exactHits.length === 1) {{
+              exactHits[0].click();
+              return {{ status: 'ok' }};
+            }}
+            return {{ status: 'ambiguous', count: matches.length }};
+          }}
+          matches[0].click();
+          return {{ status: 'ok' }};
         }})()"""
     )
-    return bool(found)
+    if isinstance(result, dict) and result.get("status") == "ambiguous":
+        raise WeekTabError(
+            f'Ambiguous week tab label "{label}": '
+            f'{result.get("count", "?")} tabs match after normalization; '
+            "no unique exact-text hit. Refusing to click the wrong week."
+        )
+    if isinstance(result, dict):
+        return result.get("status") == "ok"
+    return bool(result)
 
 
-async def selected_tab_labels(page) -> list[str]:
+async def selected_week_tab_labels(page) -> list[str]:
     """
-    Return the text of every currently selected tab
+    Return the text of selected tabs *inside the week tablist only*
     ([role=tab][aria-selected=true]), whitespace-collapsed.
 
-    The page can have more than one tablist (e.g. Standings/Schedule at the
-    top plus the week tabs), so there may be several selected tabs; the
-    caller checks whether ANY of them is the week we asked for.
+    Scoped to the week tablist so Standings/Schedule selection is ignored.
     """
     raw = await page.evaluate(
         """(() => {
-          return Array.from(document.querySelectorAll('[role=tab][aria-selected=true]'))
+          const isWeek = (t) => /LEAGUE ROUND|TOURNAMENT|PLAYOFF|Week/i.test(t);
+          const lists = Array.from(document.querySelectorAll('[role=tablist]'));
+          const weekList = lists.find((list) =>
+            Array.from(list.querySelectorAll('[role=tab]')).some((el) =>
+              isWeek(el.innerText)
+            )
+          );
+          if (!weekList) return [];
+          return Array.from(weekList.querySelectorAll('[role=tab][aria-selected=true]'))
             .map((el) => el.innerText.replace(/\\s+/g, ' ').trim());
         })()"""
     )
@@ -760,18 +796,50 @@ async def selected_tab_labels(page) -> list[str]:
 
 async def wait_for_selected_tab(page, label: str, timeout_ms: int = 3_000) -> bool:
     """
-    Poll until a selected tab's text equals `label` (case- and
+    Poll until a selected *week* tab's text equals `label` (case- and
     whitespace-insensitive), or until timeout_ms elapses.
-
-    Polling (instead of one fixed sleep) tolerates slow React re-renders
-    without waiting the full timeout when the tab switches quickly.
     """
     wanted = normalize_tab_label(label)
     step_ms = 250
     waited = 0
     while True:
-        selected = await selected_tab_labels(page)
+        selected = await selected_week_tab_labels(page)
         if any(normalize_tab_label(t) == wanted for t in selected):
+            return True
+        if waited >= timeout_ms:
+            return False
+        await page.wait_for_timeout(step_ms)
+        waited += step_ms
+
+
+async def schedule_panel_signature(page) -> str:
+    """Snapshot of visible schedule panel text (for content-change waits)."""
+    raw = await page.evaluate(
+        """(() => {
+          const panel =
+            document.querySelector('[role=tabpanel]') ||
+            document.querySelector('main') ||
+            document.body;
+          return (panel && panel.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 6000);
+        })()"""
+    )
+    return str(raw) if raw is not None else ""
+
+
+async def wait_for_schedule_content_change(
+    page, previous: str, timeout_ms: int = 5_000
+) -> bool:
+    """
+    Poll until the schedule panel text differs from `previous`, or timeout.
+
+    Replaces a fixed sleep after week-tab clicks so slow/fast renders both work.
+    Returns False on timeout (caller may still proceed if the tab is selected).
+    """
+    step_ms = 200
+    waited = 0
+    while True:
+        current = await schedule_panel_signature(page)
+        if current != previous:
             return True
         if waited >= timeout_ms:
             return False
@@ -786,7 +854,7 @@ async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
     Why verify: extract() reads whatever week is on screen. If a click silently
     fails or hits a neighboring tab, we'd save the previous week's games under
     this label (or duplicate them) with no error. So after clicking we confirm
-    [role=tab][aria-selected=true] text == label before returning.
+    the week tablist's aria-selected tab text == label before returning.
 
     Strategy per attempt:
       1. Exact-text DOM click (deterministic): fast, no LLM.
@@ -802,8 +870,9 @@ async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
     problems: list[str] = []  # Collected per-step failures for the final error
 
     for attempt in range(1, max_attempts + 1):
-        # --- Step 1: deterministic exact-text click (TS parity) ---------------
-        if await click_tab_by_exact_text(page, label):
+        # --- Step 1: deterministic exact-text click ----------------------------
+        clicked = await click_tab_by_exact_text(page, label)
+        if clicked:
             if await wait_for_selected_tab(page, label):
                 return
             problems.append(f"attempt {attempt}: exact-text click did not select the tab")
@@ -816,8 +885,6 @@ async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
                 f'Click the schedule week tab labeled exactly "{label}". '
                 "It is one of the tabs in the week/round tab list on the schedule page."
             )
-            # ActResult.data.success / .message (Stagehand v4 Python SDK).
-            # getattr keeps this tolerant of minor SDK shape changes.
             data = getattr(act_result, "data", None)
             if data is not None and getattr(data, "success", True) is False:
                 problems.append(
@@ -827,16 +894,14 @@ async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
         except Exception as err:  # noqa: BLE001 — record and keep trying / raise below
             problems.append(f"attempt {attempt}: act() raised {describe_error(err)}")
 
-        # Trust the DOM, not act()'s self-report: only a matching selected tab counts.
         if await wait_for_selected_tab(page, label):
             return
         problems.append(f"attempt {attempt}: act() did not select the tab")
 
-    # Out of attempts: report what IS selected so the mismatch is obvious.
-    selected = await selected_tab_labels(page)
+    selected = await selected_week_tab_labels(page)
     raise WeekTabError(
         f'Could not select schedule week tab "{label}" after {max_attempts} attempts. '
-        f"Currently selected tab(s): {selected or 'none'}. "
+        f"Currently selected week tab(s): {selected or 'none'}. "
         f"Details: {'; '.join(problems)}. "
         "Stopping so games aren't saved under the wrong week."
     )
@@ -1202,8 +1267,10 @@ async def scrape_llm_division(
     team_names_csv = ", ".join(team_names)
 
     for label in week_labels:
+        previous_sig = await schedule_panel_signature(page)
         await click_week_tab(stagehand, page, label)
-        await page.wait_for_timeout(750)
+        # Wait for the schedule panel to refresh (or timeout); no fixed sleep.
+        await wait_for_schedule_content_change(page, previous_sig, timeout_ms=5_000)
 
         if not await page_mentions_any_team(page, team_names):
             log(f"  {label}: no matched-team games listed")
@@ -1298,6 +1365,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
             )
             all_games: list[dict[str, Any]] = []
             rounds_without: list[str] = []
+            week_tab_errors: list[dict[str, Any]] = []
             divisions_scanned: list[dict[str, Any]] = []
             resolution: str | None = None
             last_standings_meta: dict[str, Any] = {}
@@ -1364,18 +1432,36 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
                 }
                 divisions_scanned.append(meta)
 
-                partial = await scrape_llm_division(
-                    stagehand,
-                    page,
-                    league_url=league_url,
-                    schedule_url=schedule_url,
-                    use_captain=use_captain,
-                    captain_names=captain_names,
-                    config_team_name=config_team_name,
-                    day=config.day,
-                    league=config.league,
-                    div_meta=meta,
-                )
+                try:
+                    partial = await scrape_llm_division(
+                        stagehand,
+                        page,
+                        league_url=league_url,
+                        schedule_url=schedule_url,
+                        use_captain=use_captain,
+                        captain_names=captain_names,
+                        config_team_name=config_team_name,
+                        day=config.day,
+                        league=config.league,
+                        div_meta=meta,
+                    )
+                except WeekTabError as err:
+                    # Multi-div: record and continue. Single-div: re-raise.
+                    if meta.get("singleDivision") or len(divisions) == 1:
+                        raise
+                    log(
+                        f"  week-tab error in {meta.get('divisionName') or uid}: "
+                        f"{describe_error(err)} — continuing other divisions"
+                    )
+                    week_tab_errors.append(
+                        {
+                            "divisionUid": uid,
+                            "divisionName": meta.get("divisionName"),
+                            "url": league_url,
+                            "error": describe_error(err),
+                        }
+                    )
+                    continue
                 if partial is None:
                     continue
 
@@ -1445,6 +1531,7 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
                 "divisionName": last_standings_meta.get("divisionName"),
                 "games": all_games,
                 "roundsWithoutTeamGames": rounds_without,
+                "weekTabErrors": week_tab_errors or None,
                 "tokenUsage": USAGE.as_dict(),
                 "runtimeSeconds": round(elapsed, 3),
             }

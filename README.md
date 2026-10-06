@@ -15,6 +15,12 @@ Set in `config.yaml` (`mode: lean|llm`) or override with `SCRAPE_MODE`.
 
 Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Single-division `leagueUrl` still works when `levels` is empty.
 
+## Requirements
+
+- **Python 3.11+** (required by the `stagehand` package; 3.12/3.13 fine)
+- **Google Chrome** only for **llm** mode (local browser). Lean mode needs neither Chrome nor an LLM API key.
+- `XAI_API_KEY` for **llm** mode (or `BROWSERBASE_API_KEY`)
+
 ## Layout
 
 | Path | Role |
