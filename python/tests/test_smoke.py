@@ -34,20 +34,17 @@ def test_main_module_imports() -> None:
     assert hasattr(token_usage, "USAGE")
 
 
-def test_load_config_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_config_from_example_yaml() -> None:
     """
-    Shared config.example.yaml must validate into AppConfig.
+    Shared config.example.yaml must validate into AppConfig via --config path.
 
-    Production load_config() only reads config.yaml (gitignored). In CI we
-    point CONFIG_PATH at the tracked example so packaging still verifies the
-    real loader path without committing personal config.
+    Production lookups use config.yaml (gitignored). In CI we pass the tracked
+    example explicitly so packaging still verifies the real loader.
     """
     import main
 
     assert EXAMPLE_CONFIG.is_file(), f"expected example config at {EXAMPLE_CONFIG}"
-    monkeypatch.setattr(main, "CONFIG_PATH", EXAMPLE_CONFIG)
-
-    cfg = main.load_config()
+    cfg = main.load_config(EXAMPLE_CONFIG)
     assert isinstance(cfg.captain_name, list)
     assert any(name.strip() for name in cfg.captain_name) or cfg.team_name.strip()
     assert cfg.mode in ("lean", "llm")

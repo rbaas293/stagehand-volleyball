@@ -208,6 +208,24 @@ jobs:
             python/dist/*.tar.gz
           if-no-files-found: error
 
+      - name: Smoke-test installed wheel
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install -q dist/*.whl
+          /tmp/wheel-smoke/bin/stagehand-volleyball --help
+          set +e
+          (cd /tmp && /tmp/wheel-smoke/bin/stagehand-volleyball) > /tmp/wheel-missing.out 2>&1
+          ec=$?
+          set -e
+          test "$ec" -ne 0
+          grep -q "Could not find config.yaml" /tmp/wheel-missing.out
+          grep -q "cp config.example.yaml config.yaml" /tmp/wheel-missing.out
+          /tmp/wheel-smoke/bin/stagehand-volleyball \
+            --config "${{ github.workspace }}/config.example.yaml" \
+            --check-config | tee /tmp/wheel-check.out
+          grep -q "mode:" /tmp/wheel-check.out
+
   shiv:
     name: build shiv binaries
     needs: gate-scraper-pr
@@ -249,3 +267,21 @@ jobs:
           name: python-shiv-binaries
           path: python/dist/shiv/*.pyz
           if-no-files-found: error
+
+      - name: Smoke-test shiv binary
+        run: |
+          set -euo pipefail
+          PYZ=dist/shiv/stagehand-volleyball.pyz
+          test -f "$PYZ"
+          python "$PYZ" --help
+          set +e
+          (cd /tmp && python "${{ github.workspace }}/python/$PYZ") > /tmp/shiv-missing.out 2>&1
+          ec=$?
+          set -e
+          test "$ec" -ne 0
+          grep -q "Could not find config.yaml" /tmp/shiv-missing.out
+          grep -q "cp config.example.yaml config.yaml" /tmp/shiv-missing.out
+          python "$PYZ" \
+            --config "${{ github.workspace }}/config.example.yaml" \
+            --check-config | tee /tmp/shiv-check.out
+          grep -q "mode:" /tmp/shiv-check.out

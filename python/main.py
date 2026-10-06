@@ -73,23 +73,93 @@ from token_usage import USAGE, reset_usage
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# Directory that contains this script (python/).
+# Directory that contains this module. Source checkout → python/; wheel/shiv →
+# site-packages (or the zipapp), so we must NOT resolve the user's config.yaml
+# relative to this path alone (Major M1).
 ROOT = Path(__file__).resolve().parent
 
-# Prefer the shared repo-root config.yaml; fall back to python/config.yaml.
-PARENT_CONFIG = ROOT.parent / "config.yaml"
-LOCAL_CONFIG = ROOT / "config.yaml"
-# Prefer repo-root config.yaml when present; else python/config.yaml.
-# If neither exists, keep PARENT_CONFIG so the missing-file error points at the
-# documented location (repo root) rather than the python/ fallback path.
-CONFIG_PATH = (
-    PARENT_CONFIG
-    if PARENT_CONFIG.is_file() or not LOCAL_CONFIG.is_file()
-    else LOCAL_CONFIG
-)
+# True when we are sitting in the repo's python/ tree (editable / `python main.py`),
+# not inside an installed wheel or shiv .pyz.
+_RUNNING_FROM_SOURCE = (ROOT / "pyproject.toml").is_file() or (
+    ROOT / "requirements.txt"
+).is_file()
 
-# Output lands next to this script (python/games.json).
-OUTPUT_PATH = ROOT / "games.json"
+# Env var override for config path (after --config, before cwd).
+CONFIG_ENV_VAR = "STAGEHAND_VOLLEYBALL_CONFIG"
+
+# Repo-root config when running from a source checkout (python/../config.yaml).
+PARENT_CONFIG = ROOT.parent / "config.yaml"
+# Optional python/config.yaml override (source checkout only).
+LOCAL_CONFIG = ROOT / "config.yaml"
+
+# Snapshot used for logging until resolve_config_path() runs; load_config()
+# always re-resolves.
+CONFIG_PATH = PARENT_CONFIG if _RUNNING_FROM_SOURCE else (Path.cwd() / "config.yaml")
+
+# Source checkout: write beside this script (python/games.json). Packaged/shiv:
+# write ./games.json in the caller's cwd (site-packages is often read-only).
+OUTPUT_PATH = (ROOT / "games.json") if _RUNNING_FROM_SOURCE else (Path.cwd() / "games.json")
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    """Preserve order while dropping duplicate resolved paths."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in paths:
+        key = path.resolve() if path.exists() else path.absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def resolve_config_path(cli_path: str | Path | None = None) -> Path:
+    """
+    Locate config.yaml for both source checkouts and installed wheel/shiv runs.
+
+    Precedence (first existing file wins):
+      1. --config PATH (CLI)
+      2. $STAGEHAND_VOLLEYBALL_CONFIG
+      3. ./config.yaml in the process cwd
+      4. Repo-root ../config.yaml / python/config.yaml — only when running from
+         a source checkout (pyproject.toml or requirements.txt beside this file)
+
+    Raises ConfigError listing every path tried when none exist.
+    """
+    tried: list[Path] = []
+    candidates: list[Path] = []
+
+    if cli_path is not None:
+        candidates.append(Path(cli_path).expanduser())
+
+    env_path = (os.environ.get(CONFIG_ENV_VAR) or "").strip()
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    candidates.append(Path.cwd() / "config.yaml")
+
+    if _RUNNING_FROM_SOURCE:
+        # Repo root first (shared), then optional python/ override.
+        candidates.append(PARENT_CONFIG)
+        candidates.append(LOCAL_CONFIG)
+
+    for path in _unique_paths(candidates):
+        tried.append(path)
+        if path.is_file():
+            return path
+
+    tried_lines = "\n".join(f"  - {p}" for p in tried) or "  (none)"
+    raise ConfigError(
+        "Could not find config.yaml. Tried:\n"
+        f"{tried_lines}\n"
+        "Create one with: cp config.example.yaml config.yaml\n"
+        "Or pass --config PATH / set "
+        f"{CONFIG_ENV_VAR}=PATH. "
+        "Edit captainName and/or teamName, levels / siteUrl (or leagueUrl), "
+        "and related fields. The scraper does not fall back to "
+        "config.example.yaml."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -271,18 +341,20 @@ class AppConfig(BaseModel):
 
 def load_dotenv_files() -> None:
     """
-    Optionally load python/.env and ../.env into os.environ. Keeps secrets out
-    of the repo; .env is gitignored.
+    Optionally load .env files into os.environ. Keeps secrets out of the repo;
+    .env is gitignored.
 
-    Precedence (highest first): shell exports > python/.env > ../.env (repo root).
-    Every load is "first one wins" (never overrides a var that's already set),
-    so we load the higher-priority file FIRST: python/.env, then the root .env
-    only fills in whatever is still missing.
+    Precedence (highest first): shell exports > ./.env (cwd) > python/.env >
+    ../.env (repo root, source checkout only). First file to set a key wins
+    (override=False); later files only fill gaps. Cwd is included so wheel/shiv
+    installs pick up a local .env next to where you run the binary.
     """
     # Try python-dotenv if installed; otherwise do a tiny manual parser so the
     # scraper still works without python-dotenv (only stagehand + PyYAML needed).
-    # Order matters: python/.env before ../.env (see precedence above).
-    candidates = [ROOT / ".env", ROOT.parent / ".env"]
+    candidates = [Path.cwd() / ".env"]
+    if _RUNNING_FROM_SOURCE:
+        candidates.extend([ROOT / ".env", ROOT.parent / ".env"])
+    candidates = _unique_paths(candidates)
     try:
         from dotenv import load_dotenv  # type: ignore
 
@@ -310,17 +382,24 @@ def load_dotenv_files() -> None:
                 os.environ[key] = value
 
 
-def load_config() -> AppConfig:
-    """Read and validate config.yaml (parent preferred, then python/config.yaml)."""
+def load_config(cli_path: str | Path | None = None) -> AppConfig:
+    """
+    Read and validate config.yaml.
+
+    Resolves the path via resolve_config_path() (CLI / env / cwd / source tree)
+    on every call so wheel and shiv installs honor the caller's cwd and flags.
+    """
+    global CONFIG_PATH
+    config_path = resolve_config_path(cli_path)
+    CONFIG_PATH = config_path
     try:
-        raw = CONFIG_PATH.read_text(encoding="utf-8")
+        raw = config_path.read_text(encoding="utf-8")
     except OSError as err:
         raise ConfigError(
-            f"Missing or unreadable config.yaml at {CONFIG_PATH} ({err}). "
-            "Create one with: cp config.example.yaml config.yaml "
-            "(from the repo root), then edit captainName and/or teamName, "
-            "levels / siteUrl (or leagueUrl), and related fields. "
-            "The scraper does not fall back to config.example.yaml."
+            f"Missing or unreadable config.yaml at {config_path} ({err}). "
+            "Create one with: cp config.example.yaml config.yaml, "
+            "or pass --config PATH / set "
+            f"{CONFIG_ENV_VAR}=PATH."
         ) from err
 
     try:
@@ -1589,16 +1668,17 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
         await browser.close()
 
 
-async def scrape() -> dict[str, Any]:
+async def scrape(cli_config: str | Path | None = None) -> dict[str, Any]:
     """
     End-to-end scrape. Returns the output dict that we also write to games.json.
 
     mode=lean → HTTP pub-api (no browser / no LLM)
     mode=llm  → Stagehand extract (browser + Grok BYO callback)
     Override mode with env SCRAPE_MODE=lean|llm.
+    cli_config is an optional --config PATH from the CLI.
     """
     load_dotenv_files()
-    config = load_config()
+    config = load_config(cli_config)
     mode = (os.environ.get("SCRAPE_MODE") or config.mode or "lean").strip().lower()
     if mode not in ("lean", "llm"):
         raise ConfigError(f'Invalid mode {mode!r}; use "lean" or "llm"')
@@ -1613,9 +1693,41 @@ async def scrape() -> dict[str, Any]:
     return await scrape_llm(config)
 
 
-async def async_main() -> None:
-    """Run scrape(), print JSON to stdout, write python/games.json."""
-    output = omit_nulls(await scrape())
+def parse_args(argv: list[str] | None = None) -> Any:
+    """CLI flags shared by `python main.py` and the stagehand-volleyball console script."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="stagehand-volleyball",
+        description=(
+            "Scrape league.ninja volleyball schedules (lean HTTP or Stagehand LLM). "
+            "Config resolution: --config, $"
+            + CONFIG_ENV_VAR
+            + ", ./config.yaml, then repo-root config.yaml when running from source."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Path to config.yaml (overrides env and cwd lookup)",
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help=(
+            "Load and validate config, print the resolved path and mode, then exit "
+            "(no network / browser). Useful for packaging smoke tests."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+async def async_main(cli_config: str | Path | None = None) -> None:
+    """Run scrape(), print JSON to stdout, write games.json."""
+    global OUTPUT_PATH
+    # Recompute each run so packaged binaries write into the caller's cwd.
+    OUTPUT_PATH = (ROOT / "games.json") if _RUNNING_FROM_SOURCE else (Path.cwd() / "games.json")
+    output = omit_nulls(await scrape(cli_config))
     json_text = json.dumps(output, indent=2)
     print(json_text)
     OUTPUT_PATH.write_text(json_text + "\n", encoding="utf-8")
@@ -1624,11 +1736,19 @@ async def async_main() -> None:
     log(f"Wrote {n_games} games for {n_teams} team(s) to {OUTPUT_PATH}")
 
 
-
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint: translate known errors into clean stderr + exit 1."""
     try:
-        asyncio.run(async_main())
+        args = parse_args(argv)
+        if args.check_config:
+            load_dotenv_files()
+            config = load_config(args.config)
+            print(f"config: {CONFIG_PATH}")
+            print(f"mode: {config.mode}")
+            print(f"captainName: {config.captain_name!r}")
+            print(f"teamName: {config.team_name!r}")
+            return
+        asyncio.run(async_main(args.config))
     except (ConfigError, MissingKeyError, ResolveError, WeekTabError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.

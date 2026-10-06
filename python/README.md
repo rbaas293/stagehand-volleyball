@@ -41,3 +41,21 @@ pytest -q                        # unit + smoke (no live network)
 GitHub Actions (`.github/workflows/python-ci.yml`) gates on scraper PR #1 being
 merged, then runs checks (3.11/3.12), wheel builds, and shiv binaries.
 
+## Config file location (wheels / shiv)
+
+`stagehand-volleyball` (and `python main.py`) resolve config in order:
+
+1. `--config PATH`
+2. `$STAGEHAND_VOLLEYBALL_CONFIG`
+3. `./config.yaml` (cwd)
+4. Repo-root / `python/config.yaml` only for source checkouts
+
+```bash
+stagehand-volleyball --help
+stagehand-volleyball --config /path/to/config.yaml --check-config
+stagehand-volleyball --config config.yaml          # full scrape
+```
+
+Packaged installs never read `site-packages/config.yaml`. Put `config.yaml` and
+optional `.env` in the directory you run from, or pass `--config`.
+
