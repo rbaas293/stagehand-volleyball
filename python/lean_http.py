@@ -43,6 +43,9 @@ class HttpSettings:
     jitter_s: float = 0.3
     circuit_failure_threshold: int = 5
     circuit_cooldown_s: float = 20.0
+    max_half_open_failures: int = 2
+    max_circuit_trips: int = 3
+    run_deadline_s: float = 120.0
     concurrency: int = 4
     user_agent: str = (
         "stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)"
@@ -64,6 +67,9 @@ class HttpSettings:
             "jitterS": "jitter_s",
             "circuitFailureThreshold": "circuit_failure_threshold",
             "circuitCooldownS": "circuit_cooldown_s",
+            "maxHalfOpenFailures": "max_half_open_failures",
+            "maxCircuitTrips": "max_circuit_trips",
+            "runDeadlineS": "run_deadline_s",
             "concurrency": "concurrency",
             "userAgent": "user_agent",
         }
@@ -85,6 +91,7 @@ class HttpRunStats:
     partial_json_retries: int = 0
     circuit_trips: int = 0
     circuit_open_rejections: int = 0
+    half_open_failures: int = 0
     by_error: dict[str, int] = field(default_factory=dict)
 
     def record_error(self, label: str) -> None:
@@ -100,6 +107,7 @@ class HttpRunStats:
             "partialJsonRetries": self.partial_json_retries,
             "circuitTrips": self.circuit_trips,
             "circuitOpenRejections": self.circuit_open_rejections,
+            "halfOpenFailures": self.half_open_failures,
             "byError": dict(self.by_error) or None,
         }
 
@@ -149,7 +157,12 @@ def _parse_retry_after(headers: Any) -> float | None:
 
 
 class LeanHttpClient:
-    """Thread-safe keep-alive HTTP client with retries, budget, and circuit breaker."""
+    """Thread-safe keep-alive HTTP client with retries, budget, and circuit breaker.
+
+    The circuit breaker is **shared across the whole client** (not per-request
+    isolation), so a host outage fails the run quickly instead of serializing
+    cooldown+probe once per division.
+    """
 
     def __init__(self, settings: HttpSettings | None = None) -> None:
         self.settings = settings or HttpSettings()
@@ -158,21 +171,41 @@ class LeanHttpClient:
         # One keep-alive pool per thread — http.client connections are not
         # safe to share across concurrent requests on the same socket.
         self._local = threading.local()
-        self._fail_streak: dict[str, int] = {}
-        self._circuit_until: dict[str, float] = {}
-        self._circuit_state: dict[str, str] = {}  # closed | open | half_open
-        self._half_open_holder: dict[str, int | None] = {}
+        self._fail_streak = 0
+        self._circuit_until = 0.0
+        self._circuit_state = "closed"  # closed | open | half_open | tripped
+        self._half_open_holder: int | None = None
+        self._half_open_failures = 0
         self._retries_used = 0
+        self._run_deadline: float | None = None
+        self._fatal: CircuitTrippedError | None = None
         self._ssl_ctx = ssl.create_default_context()
 
     def reset_stats(self) -> None:
         with self._lock:
             self.stats = HttpRunStats()
             self._retries_used = 0
-            self._fail_streak.clear()
-            self._circuit_until.clear()
-            self._circuit_state.clear()
-            self._half_open_holder.clear()
+            self._fail_streak = 0
+            self._circuit_until = 0.0
+            self._circuit_state = "closed"
+            self._half_open_holder = None
+            self._half_open_failures = 0
+            self._run_deadline = None
+            self._fatal = None
+
+    def begin_run(self) -> None:
+        """Mark the start of a scrape run (deadline + fresh breaker budget)."""
+        with self._lock:
+            self.reset_stats()
+            self._run_deadline = time.monotonic() + self.settings.run_deadline_s
+
+    def is_run_aborted(self) -> bool:
+        with self._lock:
+            return self._fatal is not None
+
+    def run_abort_error(self) -> CircuitTrippedError | None:
+        with self._lock:
+            return self._fatal
 
     def configure(self, settings: HttpSettings) -> None:
         with self._lock:
@@ -201,86 +234,145 @@ class LeanHttpClient:
         with self._lock:
             self._close_all_unlocked()
 
-    def _open_circuit(self, host: str) -> None:
-        """Transition host to open; count a trip once per opening."""
-        self._circuit_state[host] = "open"
-        self._circuit_until[host] = time.monotonic() + self.settings.circuit_cooldown_s
-        self._half_open_holder[host] = None
-        self._fail_streak[host] = 0
-        self.stats.circuit_trips += 1
-        conn = self._thread_conns().pop(host, None)
-        if conn:
-            try:
-                conn.close()
-            except OSError:
-                pass
+    def _trip_run(self, message: str) -> None:
+        """Abort the whole run; subsequent get_json calls raise immediately."""
+        self._circuit_state = "tripped"
+        self._half_open_holder = None
+        if self._fatal is None:
+            self._fatal = CircuitTrippedError(message)
+            self.stats.circuit_trips += 1
 
-    def _check_circuit(self, host: str) -> None:
+    def _open_circuit(self) -> None:
+        """Transition to open; count a trip once per opening."""
+        self._circuit_state = "open"
+        self._circuit_until = time.monotonic() + self.settings.circuit_cooldown_s
+        self._half_open_holder = None
+        self._fail_streak = 0
+        self.stats.circuit_trips += 1
+        if self.stats.circuit_trips >= self.settings.max_circuit_trips:
+            self._trip_run(
+                f"HTTP circuit breaker: trip budget exhausted "
+                f"({self.stats.circuit_trips} trips)"
+            )
+            return
+        # Drop this thread's pooled conns; other threads drop on next use/invalidate.
+        self._close_all_unlocked()
+
+    def _check_deadline(self) -> None:
+        if self._fatal is not None:
+            raise self._fatal
+        if self._run_deadline is not None and time.monotonic() >= self._run_deadline:
+            self._trip_run(
+                f"Lean HTTP run deadline exceeded ({self.settings.run_deadline_s:.0f}s)"
+            )
+            raise self._fatal
+
+    def _enter_circuit(self) -> bool:
         """
-        Closed: proceed.
-        Open: wait the remaining cooldown (bounded), then become half-open probe.
-        Half-open: only the probe holder proceeds; others wait briefly for resolution.
+        Gate requests through the shared breaker.
+
+        Returns True if this caller is the half-open probe holder (must release
+        in finally via _release_probe).
         """
         tid = threading.get_ident()
-        deadline = time.monotonic() + max(self.settings.circuit_cooldown_s * 3, 1.0)
+        # Bound total wait so a timed-out probe cannot stall every worker.
+        wait_deadline = time.monotonic() + max(self.settings.circuit_cooldown_s * 2, 1.0)
         while True:
+            self._check_deadline()
             wait_for = 0.0
             with self._lock:
-                state = self._circuit_state.get(host, "closed")
+                if self._fatal is not None:
+                    raise self._fatal
+                state = self._circuit_state
                 if state == "closed":
-                    return
+                    return False
+                if state == "tripped":
+                    self.stats.circuit_open_rejections += 1
+                    raise self._fatal or CircuitTrippedError("HTTP circuit breaker tripped")
                 if state == "open":
-                    remaining = self._circuit_until.get(host, 0.0) - time.monotonic()
+                    remaining = self._circuit_until - time.monotonic()
                     if remaining > 0:
                         wait_for = min(remaining, self.settings.circuit_cooldown_s)
-                    elif self._half_open_holder.get(host) is None:
-                        self._circuit_state[host] = "half_open"
-                        self._half_open_holder[host] = tid
-                        return
+                    elif self._half_open_holder is None:
+                        self._circuit_state = "half_open"
+                        self._half_open_holder = tid
+                        return True
                     else:
                         wait_for = 0.05
                 elif state == "half_open":
-                    if self._half_open_holder.get(host) == tid:
-                        return
+                    if self._half_open_holder == tid:
+                        return True
                     wait_for = 0.05
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= wait_deadline:
                 with self._lock:
                     self.stats.circuit_open_rejections += 1
-                raise CircuitOpenError(
-                    f"Circuit open for {host}: timed out waiting for cooldown/probe "
-                    f"(after {self.settings.circuit_failure_threshold} consecutive failures)"
-                )
+                    self._trip_run(
+                        "HTTP circuit breaker: timed out waiting for cooldown/probe; "
+                        "aborting run"
+                    )
+                raise self._fatal
             if wait_for > 0:
                 time.sleep(wait_for)
 
-    def _record_success(self, host: str) -> None:
-        with self._lock:
-            self._fail_streak[host] = 0
-            self.stats.successes += 1
-            # Half-open probe succeeded → close the circuit.
-            if self._circuit_state.get(host) == "half_open":
-                self._circuit_state[host] = "closed"
-                self._circuit_until.pop(host, None)
-                self._half_open_holder[host] = None
-
-    def _record_failure(self, host: str, label: str, *, toward_breaker: bool = True) -> None:
+    def _release_probe(self, *, outcome: str) -> None:
         """
-        Record a failure. Only transport / 5xx / 429 count toward the breaker.
-        Other 4xx (e.g. 404) must not open the circuit.
+        Release the half-open probe holder.
+
+        outcome: "success" | "breaker_failure" | "other"
+        Must be called from a finally so 404 / non-UTF-8 / API errors cannot stick
+        the holder.
+        """
+        tid = threading.get_ident()
+        with self._lock:
+            if self._half_open_holder != tid:
+                return
+            self._half_open_holder = None
+            if self._circuit_state != "half_open":
+                return
+            if outcome == "success":
+                self._circuit_state = "closed"
+                self._circuit_until = 0.0
+                self._half_open_failures = 0
+                self._fail_streak = 0
+            elif outcome == "breaker_failure":
+                self.stats.half_open_failures += 1
+                self._half_open_failures += 1
+                if self._half_open_failures >= self.settings.max_half_open_failures:
+                    self._trip_run(
+                        f"HTTP circuit breaker: {self._half_open_failures} consecutive "
+                        f"failed half-open probes; aborting run"
+                    )
+                else:
+                    self._open_circuit()
+            else:
+                # Non-breaker failure during probe (404, bad body, API envelope):
+                # release holder and return to open so another request can probe.
+                self._circuit_state = "open"
+                self._circuit_until = time.monotonic() + self.settings.circuit_cooldown_s
+
+    def _record_success(self) -> None:
+        with self._lock:
+            self._fail_streak = 0
+            self.stats.successes += 1
+
+    def _record_failure(self, label: str, *, toward_breaker: bool = True) -> str:
+        """
+        Record a failure. Returns probe outcome hint for _release_probe:
+        "breaker_failure" | "other".
         """
         with self._lock:
             self.stats.failures += 1
             self.stats.record_error(label)
             if not toward_breaker:
-                return
-            if self._circuit_state.get(host) == "half_open":
-                # Probe failed → re-open.
-                self._open_circuit(host)
-                return
-            streak = self._fail_streak.get(host, 0) + 1
-            self._fail_streak[host] = streak
-            if streak >= self.settings.circuit_failure_threshold:
-                self._open_circuit(host)
+                return "other"
+            if self._circuit_state == "half_open":
+                return "breaker_failure"
+            self._fail_streak += 1
+            if self._fail_streak >= self.settings.circuit_failure_threshold:
+                self._open_circuit()
+                if self._fatal is not None:
+                    raise self._fatal
+            return "breaker_failure"
 
     def _get_conn(self, parsed: urllib.parse.ParseResult, host: str) -> http.client.HTTPConnection:
         conns = self._thread_conns()
@@ -349,73 +441,91 @@ class LeanHttpClient:
         settings = self.settings
         attempts = max(1, settings.max_retries)
         last_err: BaseException | None = None
+        is_probe = False
+        probe_outcome = "other"
 
-        for attempt in range(1, attempts + 1):
-            with self._lock:
-                self.stats.attempts += 1
-            self._check_circuit(host)
-
-            try:
-                body = self._raw_get(parsed, host, path)
+        try:
+            is_probe = self._enter_circuit()
+            for attempt in range(1, attempts + 1):
+                with self._lock:
+                    self.stats.attempts += 1
+                # Re-check abort between attempts (another worker may have tripped).
+                if self.is_run_aborted():
+                    raise self.run_abort_error()  # type: ignore[misc]
                 try:
-                    payload = json.loads(body)
-                except json.JSONDecodeError as err:
+                    body = self._raw_get(parsed, host, path)
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError as err:
+                        last_err = err
+                        with self._lock:
+                            self.stats.partial_json_retries += 1
+                            self.stats.record_error("partial_json")
+                        if attempt < attempts and self._budget_allow_retry():
+                            self._invalidate_conn(host)
+                            self._sleep_backoff(attempt)
+                            continue
+                        probe_outcome = self._record_failure("partial_json")
+                        raise LeanApiError(
+                            f"Bad/partial JSON from {url} after {attempt} attempt(s): {err}"
+                        ) from err
+
+                    if isinstance(payload, dict) and "Data" in payload and "StatusCode" in payload:
+                        code = payload.get("StatusCode")
+                        if code not in (200, None) and payload.get("Data") is None:
+                            # API envelope error — not a breaker failure.
+                            probe_outcome = "other"
+                            raise LeanApiError(
+                                f"API error for {url}: {payload.get('ErrorMessage') or code}"
+                            )
+                        self._record_success()
+                        probe_outcome = "success"
+                        return payload["Data"]
+                    self._record_success()
+                    probe_outcome = "success"
+                    return payload
+
+                except CircuitTrippedError:
+                    probe_outcome = "breaker_failure"
+                    raise
+                except LeanApiError:
+                    # probe_outcome already set when we raised above; keep "other" for API errs.
+                    raise
+                except urllib.error.HTTPError as err:
                     last_err = err
-                    with self._lock:
-                        self.stats.partial_json_retries += 1
-                        self.stats.record_error("partial_json")
+                    retry_after = _parse_retry_after(getattr(err, "headers", None))
+                    retryable = err.code in (429, 500, 502, 503, 504)
+                    counts_for_breaker = err.code == 429 or err.code >= 500
+                    if retryable and attempt < attempts and self._budget_allow_retry():
+                        self._invalidate_conn(host)
+                        self._sleep_backoff(
+                            attempt,
+                            retry_after=retry_after if err.code in (429, 503) else None,
+                        )
+                        continue
+                    probe_outcome = self._record_failure(
+                        f"http_{err.code}", toward_breaker=counts_for_breaker
+                    )
+                    raise LeanApiError(
+                        f"HTTP {err.code} for {url}: {err.reason or err}"
+                    ) from err
+                except (http.client.HTTPException, OSError, TimeoutError) as err:
+                    last_err = err
+                    label = type(err).__name__
                     if attempt < attempts and self._budget_allow_retry():
                         self._invalidate_conn(host)
                         self._sleep_backoff(attempt)
                         continue
-                    self._record_failure(host, "partial_json")
+                    probe_outcome = self._record_failure(label)
                     raise LeanApiError(
-                        f"Bad/partial JSON from {url} after {attempt} attempt(s): {err}"
+                        f"Request failed for {url} after {attempt} attempt(s): "
+                        f"{type(err).__name__}: {err}"
                     ) from err
 
-                if isinstance(payload, dict) and "Data" in payload and "StatusCode" in payload:
-                    code = payload.get("StatusCode")
-                    if code not in (200, None) and payload.get("Data") is None:
-                        raise LeanApiError(
-                            f"API error for {url}: {payload.get('ErrorMessage') or code}"
-                        )
-                    self._record_success(host)
-                    return payload["Data"]
-                self._record_success(host)
-                return payload
-
-            except LeanApiError:
-                raise
-            except urllib.error.HTTPError as err:
-                last_err = err
-                retry_after = _parse_retry_after(getattr(err, "headers", None))
-                retryable = err.code in (429, 500, 502, 503, 504)
-                counts_for_breaker = err.code == 429 or err.code >= 500
-                if retryable and attempt < attempts and self._budget_allow_retry():
-                    self._invalidate_conn(host)
-                    self._sleep_backoff(
-                        attempt,
-                        retry_after=retry_after if err.code in (429, 503) else None,
-                    )
-                    continue
-                self._record_failure(
-                    host, f"http_{err.code}", toward_breaker=counts_for_breaker
-                )
-                raise LeanApiError(f"HTTP {err.code} for {url}: {err.reason or err}") from err
-            except (http.client.HTTPException, OSError, TimeoutError) as err:
-                last_err = err
-                label = type(err).__name__
-                if attempt < attempts and self._budget_allow_retry():
-                    self._invalidate_conn(host)
-                    self._sleep_backoff(attempt)
-                    continue
-                self._record_failure(host, label)
-                raise LeanApiError(
-                    f"Request failed for {url} after {attempt} attempt(s): "
-                    f"{type(err).__name__}: {err}"
-                ) from err
-
-        raise LeanApiError(f"Request failed for {url}: {last_err}")
+            raise LeanApiError(f"Request failed for {url}: {last_err}")
+        finally:
+            if is_probe:
+                self._release_probe(outcome=probe_outcome)
 
     def _raw_get(
         self, parsed: urllib.parse.ParseResult, host: str, path: str
@@ -464,11 +574,11 @@ def get_client() -> LeanHttpClient:
 
 
 def configure_http(settings: HttpSettings | None = None) -> LeanHttpClient:
-    """Apply settings and reset run stats (call at the start of each scrape)."""
+    """Apply settings and start a fresh run budget/deadline (call at scrape start)."""
     client = _CLIENT
     if settings is not None:
         client.configure(settings)
-    client.reset_stats()
+    client.begin_run()
     return client
 
 

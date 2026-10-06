@@ -69,6 +69,7 @@ from lean_api import (
     infer_api_base,
     list_seasons,
     pick_season_for_levels,
+    StandingsProbeError,
     standing_row_from_api,
 )
 from lean_http import CircuitTrippedError, HttpSettings, configure_http, get_client
@@ -251,6 +252,9 @@ class HttpConfig(BaseModel):
     jitter_s: float = Field(default=0.3, alias="jitterS")
     circuit_failure_threshold: int = Field(default=5, alias="circuitFailureThreshold")
     circuit_cooldown_s: float = Field(default=20.0, alias="circuitCooldownS")
+    max_half_open_failures: int = Field(default=2, ge=1, alias="maxHalfOpenFailures")
+    max_circuit_trips: int = Field(default=3, ge=1, alias="maxCircuitTrips")
+    run_deadline_s: float = Field(default=120.0, gt=0, alias="runDeadlineS")
     concurrency: int = Field(default=4, ge=1, le=32)
     user_agent: str = Field(
         default="stagehand-volleyball/lean (+https://github.com/rbaas293/stagehand-volleyball)",
@@ -270,6 +274,9 @@ class HttpConfig(BaseModel):
             jitter_s=self.jitter_s,
             circuit_failure_threshold=self.circuit_failure_threshold,
             circuit_cooldown_s=self.circuit_cooldown_s,
+            max_half_open_failures=self.max_half_open_failures,
+            max_circuit_trips=self.max_circuit_trips,
+            run_deadline_s=self.run_deadline_s,
             concurrency=self.concurrency,
             user_agent=self.user_agent,
         )
@@ -1311,6 +1318,8 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
 
         try:
             rows_raw = get_standings(api_base, uid)
+        except CircuitTrippedError:
+            raise
         except LeanApiError as err:
             result["error"] = {**meta, "stage": "standings", "error": str(err)}
             return result
@@ -1331,6 +1340,8 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
 
         try:
             schedule = get_schedule_v2(api_base, uid)
+        except CircuitTrippedError:
+            raise
         except LeanApiError as err:
             result["error"] = {**meta, "stage": "schedule", "error": str(err)}
             return result
@@ -1374,15 +1385,23 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         return result
 
     # Preserve input order when merging concurrent results.
+    # On circuit trip / run abort: cancel remaining futures and stop (no long cooldown cascade).
     ordered_results: list[dict[str, Any] | None] = [None] * len(divisions)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    future_map: dict[Any, int] = {}
+    try:
         future_map = {
             pool.submit(_process_division, div): idx for idx, div in enumerate(divisions)
         }
         for fut in as_completed(future_map):
+            abort = get_client().run_abort_error()
+            if abort is not None:
+                raise abort
             idx = future_map[fut]
             try:
                 ordered_results[idx] = fut.result()
+            except CircuitTrippedError:
+                raise
             except Exception as err:  # noqa: BLE001 — isolate unexpected worker crashes
                 div = divisions[idx]
                 ordered_results[idx] = {
@@ -1405,6 +1424,8 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
                     "meta": None,
                     "scanned": False,
                 }
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     for result in ordered_results:
         if result is None:
@@ -1464,12 +1485,16 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         f'If this is the wrong season (e.g. Fall with no Beer A/B), set config '
         f'season to a name or uid (see config.example.yaml), e.g. season: "Summer III- 2026".'
     )
+    abort = get_client().run_abort_error()
+    if abort is not None:
+        raise abort
     http_stats_pre = get_client().stats
     circuit_blocked = [
         e
         for e in division_errors
         if "Circuit open" in str(e.get("error") or "")
         or "circuit" in str(e.get("error") or "").lower()
+        or "circuit breaker" in str(e.get("error") or "").lower()
     ]
     if http_stats_pre.circuit_trips > 0 and (
         circuit_blocked or http_stats_pre.circuit_open_rejections > 0
@@ -2036,7 +2061,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"teamName: {config.team_name!r}")
             return
         asyncio.run(async_main(args.config, args.env_file))
-    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, CircuitTrippedError, LeanApiError) as err:
+    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, CircuitTrippedError, StandingsProbeError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.
         print(describe_error(err), file=sys.stderr)

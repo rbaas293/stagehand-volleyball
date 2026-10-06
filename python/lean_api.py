@@ -49,6 +49,7 @@ __all__ = [
     "CircuitTrippedError",
     "HttpSettings",
     "LeanApiError",
+    "StandingsProbeError",
     "configure_http",
     "get_client",
     "http_get_json",
@@ -192,28 +193,35 @@ def pick_current_season(
 NOT_POSTED_YET = "not posted yet"
 
 
+class StandingsProbeError(LeanApiError):
+    """Standings probes failed (errors, not empty). Do not fall back or write games.json."""
+
+
+
 def _season_has_posted_data(
     matched: list[dict[str, Any]],
     *,
     api_base: str,
     probe_standings: Callable[[str, str], list[dict[str, Any]]] | None,
     probe_limit: int = 8,
-) -> tuple[bool, str]:
+) -> tuple[str, str]:
     """
-    True when the season looks posted for our levels.
+    Classify whether a season has posted data for our levels.
 
-    - 0 matching divisions → not posted yet
-    - If probe_standings is provided: need at least one probed division with teams
-      (empty standings across probes → not posted yet)
-    - If no probe: matching divisions alone count as posted
+    Returns (status, detail) where status is:
+      - "posted": at least one probe returned teams (or no probing)
+      - "not_posted": matching divisions missing, or all probes returned empty standings
+      - "probe_failed": at least one probe raised LeanApiError and none returned teams
+        (must NOT fall back to another season)
     """
     if not matched:
-        return False, NOT_POSTED_YET
+        return "not_posted", NOT_POSTED_YET
     if probe_standings is None:
-        return True, "has matching divisions"
+        return "posted", "has matching divisions"
     empty = 0
     probed = 0
     probe_errors = 0
+    last_err: str | None = None
     for d in matched[: max(1, probe_limit)]:
         uid = str(d.get("divisionUid") or "")
         if not uid:
@@ -221,23 +229,22 @@ def _season_has_posted_data(
         probed += 1
         try:
             rows = probe_standings(api_base, uid)
-        except LeanApiError:
-            # Persistent 5xx / transport on one division must not abort season pick.
+        except LeanApiError as err:
             probe_errors += 1
+            last_err = str(err)
             continue
         if rows:
-            return True, "has teams in standings"
+            return "posted", "has teams in standings"
         empty += 1
     if probed == 0:
-        return True, "has matching divisions"
-    # All probes errored → treat as not posted yet and try next season.
-    if probe_errors and empty == 0 and probe_errors == probed:
-        return False, NOT_POSTED_YET
+        return "posted", "has matching divisions"
+    # Any probe error with no teams found → hard failure (never fall back).
+    if probe_errors > 0:
+        detail = last_err or "standings probe failed"
+        return "probe_failed", detail
     if empty == probed:
-        return False, NOT_POSTED_YET
-    if empty + probe_errors == probed:
-        return False, NOT_POSTED_YET
-    return True, "has matching divisions"
+        return "not_posted", NOT_POSTED_YET
+    return "posted", "has matching divisions"
 
 
 def pick_season_for_levels(
@@ -272,13 +279,18 @@ def pick_season_for_levels(
         name = str(cand.get("name") or uid)
         all_divs = list_divs(api_base, uid)
         matched = filter_divisions_by_levels(all_divs, levels)
-        ok, detail = _season_has_posted_data(
+        status, detail = _season_has_posted_data(
             matched,
             api_base=api_base,
             probe_standings=probe_standings,
             probe_limit=probe_limit,
         )
-        if not ok:
+        if status == "probe_failed":
+            raise StandingsProbeError(
+                f"Standings probe failed for season {name!r} ({uid}): {detail}. "
+                f"Not falling back to another season; refusing to overwrite games.json."
+            )
+        if status == "not_posted":
             reason = NOT_POSTED_YET
             if not matched:
                 _log(

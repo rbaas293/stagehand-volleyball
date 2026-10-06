@@ -174,10 +174,13 @@ def test_circuit_breaker_opens_after_consecutive_failures():
         max_retries_total=20,
         circuit_failure_threshold=3,
         circuit_cooldown_s=0.01,
+        max_half_open_failures=2,
+        max_circuit_trips=5,
         backoff_base_s=0.01,
         jitter_s=0,
     )
     client = LeanHttpClient(settings)
+    client.begin_run()
     conn = MagicMock()
     conn.request.side_effect = ConnectionResetError("reset")
     conn.sock = MagicMock()
@@ -190,10 +193,11 @@ def test_circuit_breaker_opens_after_consecutive_failures():
             with pytest.raises(LeanApiError):
                 client.get_json("https://example.test/api")
         assert client.stats.circuit_trips == 1
-        # Half-open probe also fails → circuit re-opens (second trip).
+        assert client._circuit_state == "open"
+        # Half-open probe also fails → re-open (or trip once half-open budget exhausted).
         with pytest.raises(LeanApiError):
             client.get_json("https://example.test/api")
-    assert client.stats.circuit_trips >= 2
+    assert client.stats.circuit_trips >= 2 or client._circuit_state == "tripped"
 
 
 
@@ -234,7 +238,7 @@ def test_four_xx_except_429_do_not_open_circuit():
         data = client.get_json("https://example.test/d")
     assert data == {"ok": True}
     assert client.stats.circuit_trips == 0
-    assert client._circuit_state.get("https://example.test:443", "closed") == "closed"
+    assert client._circuit_state == "closed"
 
 
 def test_five_xx_opens_breaker_half_open_probe_closes():
@@ -245,10 +249,13 @@ def test_five_xx_opens_breaker_half_open_probe_closes():
             max_retries_total=50,
             circuit_failure_threshold=3,
             circuit_cooldown_s=0.01,
+            max_half_open_failures=2,
+            max_circuit_trips=5,
             backoff_base_s=0.01,
             jitter_s=0,
         )
     )
+    client.begin_run()
     conn = MagicMock()
     calls = {"n": 0}
 
@@ -275,7 +282,7 @@ def test_five_xx_opens_breaker_half_open_probe_closes():
         # Cooldown elapsed (sleep patched / cooldown tiny); this call is the half-open probe.
         data = client.get_json("https://example.test/api")
     assert data == [1]
-    assert client._circuit_state.get("https://example.test:443", "closed") == "closed"
+    assert client._circuit_state == "closed"
 
 
 def test_circuit_tripped_error_leaves_games_json_untouched(tmp_path, monkeypatch):
@@ -298,3 +305,179 @@ def test_circuit_tripped_error_leaves_games_json_untouched(tmp_path, monkeypatch
         main_mod.main([])
     assert ei.value.code == 1
     assert games.read_text(encoding="utf-8") == original
+
+
+def test_half_open_holder_released_after_404():
+    """404 during half-open must release the probe holder (finally), not stick the breaker."""
+    client = LeanHttpClient(
+        HttpSettings(
+            max_retries=1,
+            max_retries_total=50,
+            circuit_failure_threshold=2,
+            circuit_cooldown_s=0.01,
+            max_half_open_failures=5,
+            max_circuit_trips=10,
+            backoff_base_s=0.01,
+            jitter_s=0,
+        )
+    )
+    client.begin_run()
+    conn = MagicMock()
+    calls = {"n": 0}
+
+    def getresponse():
+        calls["n"] += 1
+        resp = MagicMock()
+        resp.headers = {}
+        resp.read.return_value = b""
+        if calls["n"] <= 2:
+            resp.status = 503
+            resp.reason = "Unavailable"
+            return resp
+        resp.status = 404
+        resp.reason = "Not Found"
+        return resp
+
+    conn.request = MagicMock()
+    conn.getresponse.side_effect = getresponse
+    conn.sock = MagicMock()
+
+    with patch.object(client, "_get_conn", return_value=conn), patch("lean_http.time.sleep"):
+        for _ in range(2):
+            with pytest.raises(LeanApiError, match="HTTP 503"):
+                client.get_json("https://example.test/api")
+        assert client._circuit_state == "open"
+        with pytest.raises(LeanApiError, match="HTTP 404"):
+            client.get_json("https://example.test/api")
+    assert client._half_open_holder is None
+    assert client._circuit_state in ("open", "closed")
+
+
+def test_half_open_holder_released_after_non_utf8():
+    """Non-UTF-8 body during half-open must release the probe holder."""
+    client = LeanHttpClient(
+        HttpSettings(
+            max_retries=1,
+            max_retries_total=50,
+            circuit_failure_threshold=2,
+            circuit_cooldown_s=0.01,
+            max_half_open_failures=5,
+            max_circuit_trips=10,
+            backoff_base_s=0.01,
+            jitter_s=0,
+        )
+    )
+    client.begin_run()
+    conn = MagicMock()
+    calls = {"n": 0}
+
+    def getresponse():
+        calls["n"] += 1
+        resp = MagicMock()
+        resp.headers = {}
+        if calls["n"] <= 2:
+            resp.status = 503
+            resp.reason = "Unavailable"
+            resp.read.return_value = b""
+            return resp
+        resp.status = 200
+        resp.reason = "OK"
+        resp.read.return_value = b"\xff\xfe not utf8"
+        return resp
+
+    conn.request = MagicMock()
+    conn.getresponse.side_effect = getresponse
+    conn.sock = MagicMock()
+
+    with patch.object(client, "_get_conn", return_value=conn), patch("lean_http.time.sleep"):
+        for _ in range(2):
+            with pytest.raises(LeanApiError, match="HTTP 503"):
+                client.get_json("https://example.test/api")
+        with pytest.raises(LeanApiError, match="Non-UTF8"):
+            client.get_json("https://example.test/api")
+    assert client._half_open_holder is None
+
+
+def test_persistent_5xx_aborts_run_within_few_seconds():
+    """Shared breaker + half-open budget: persistent outage fails fast (not ~12 min)."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = LeanHttpClient(
+        HttpSettings(
+            max_retries=1,
+            max_retries_total=200,
+            circuit_failure_threshold=2,
+            circuit_cooldown_s=0.05,
+            max_half_open_failures=2,
+            max_circuit_trips=3,
+            run_deadline_s=30.0,
+            backoff_base_s=0.01,
+            jitter_s=0,
+        )
+    )
+    client.begin_run()
+    conn = MagicMock()
+
+    def getresponse():
+        resp = MagicMock()
+        resp.status = 503
+        resp.reason = "Unavailable"
+        resp.headers = {}
+        resp.read.return_value = b""
+        return resp
+
+    conn.request = MagicMock()
+    conn.getresponse.side_effect = getresponse
+    conn.sock = MagicMock()
+
+    t0 = time.perf_counter()
+    errors: list[BaseException] = []
+
+    def once():
+        try:
+            client.get_json("https://example.test/api")
+        except BaseException as err:  # noqa: BLE001
+            errors.append(err)
+            raise
+
+    with patch.object(client, "_get_conn", return_value=conn):
+        # Real short sleeps (cooldown 50ms) — still must finish in a few seconds.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(once) for _ in range(24)]
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except (LeanApiError, CircuitTrippedError):
+                    pass
+                if client.is_run_aborted():
+                    break
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    elapsed = time.perf_counter() - t0
+    assert client.is_run_aborted() or any(isinstance(e, CircuitTrippedError) for e in errors)
+    assert elapsed < 5.0, f"persistent outage took {elapsed:.2f}s (expected <5s)"
+
+
+def test_persistent_5xx_scrape_leaves_games_json_untouched(tmp_path, monkeypatch):
+    """End-to-end: circuit abort during scrape_lean → exit 1, games.json unchanged."""
+    import main as main_mod
+
+    games = tmp_path / "games.json"
+    original = '{"matchedTeams":["keep-me"],"games":[{"t":1}]}'
+    games.write_text(original, encoding="utf-8")
+
+    async def _boom(_cli=None, _env=None):
+        raise CircuitTrippedError(
+            "HTTP circuit breaker: 2 consecutive failed half-open probes; aborting run"
+        )
+
+    monkeypatch.setattr(main_mod, "scrape", _boom)
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    monkeypatch.setattr(main_mod, "_RUNNING_FROM_SOURCE", True)
+
+    with pytest.raises(SystemExit) as ei:
+        main_mod.main([])
+    assert ei.value.code == 1
+    assert games.read_text(encoding="utf-8") == original
+
