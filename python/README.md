@@ -11,17 +11,15 @@ See the [root README](../README.md) for config, modes, and environment variables
 ## Setup
 
 ```bash
-cd python
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env               # or reuse the repo-root .env
+cp ../config.example.yaml ../config.yaml   # once; gitignored
 # edit ../config.yaml — captainName / levels / mode / …
 export XAI_API_KEY=...             # llm mode only, if not using .env
 python main.py                     # lean by default
 ```
 
-`main.py` reads both `python/.env` and the repo-root `../.env`. Precedence, highest first: **shell exports > `python/.env` > `../.env`**.
-
 Config: prefers **`../config.yaml`**, falls back to `python/config.yaml`.
+Env: shell > `python/.env` > `../.env`.
 Output: `python/games.json` (gitignored).
