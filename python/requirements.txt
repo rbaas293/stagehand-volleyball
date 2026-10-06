@@ -1,5 +1,5 @@
 # Stagehand v4 Python SDK (act / extract / observe + local Chrome / Browserbase).
-# Pin to the same major as the TypeScript package (@browserbasehq/stagehand ^4.1.0).
+# Pin Stagehand v4 (same major as historically used in this repo).
 stagehand==4.1.0
 
 # Pydantic is pulled in by stagehand; listed explicitly because our schemas use it.
@@ -11,3 +11,7 @@ PyYAML>=6.0,<7
 # Optional: load ../.env and python/.env automatically. main.py also has a
 # tiny manual .env parser if this isn't installed.
 python-dotenv>=1.0,<2
+
+# OpenAI-compatible client pointed at https://api.x.ai/v1 (Stagehand v4 has no
+# native xAI provider; we bring Grok via Stagehand's BYO LLM callback).
+openai>=1.0,<2

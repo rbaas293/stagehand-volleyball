@@ -2,16 +2,16 @@
  * Stagehand v4 scraper: volleyball game times for a team (or captain) on league.ninja.
  *
  * Run:  pnpm install && pnpm scrape
- * Env:  OPENAI_API_KEY      required for the default local-Chrome mode
+ * Env:  XAI_API_KEY         required for the default local-Chrome mode (Grok)
  *       BROWSERBASE_API_KEY optional: run in a Browserbase cloud browser instead
- *       STAGEHAND_MODEL     optional, default "openai/gpt-5.6-luna"
+ *       STAGEHAND_MODEL     optional, overrides config.yaml model (default "grok-4-fast-reasoning")
  *       HEADLESS=false      optional: show the local Chrome window
  *
  * Target captain / team / day / league / URL come from config.yaml (see config.example.yaml).
  *
  * Resolution:
  *   - If captainName is set (non-empty), discover team(s) on the standings page whose
- *     captain matches (case-insensitive, partial OK: "Robinson" matches "H. Robinson"),
+ *     captain matches (exact after normalizing punctuation/case: "R. Baas" ≡ "R Baas"),
  *     then scrape all games for those team name(s).
  *   - If captainName is empty/absent, use teamName as an explicit team override.
  *
@@ -31,32 +31,46 @@ import {
   browserbase,
   localBrowser,
   Stagehand,
-  type ModelName,
   type StagehandBrowser,
 } from "@browserbasehq/stagehand";
+import OpenAI from "openai";
 import { z } from "zod/v4";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(ROOT, "config.yaml");
 
 // ---- Config (captain / team / day / league / URL) --------------------------
+/** Coerce captainName: string | string[] → trimmed non-empty string[]. */
+const CaptainNameSchema = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .transform((v): string[] => {
+    if (v == null) return [];
+    const list = Array.isArray(v) ? v : [v];
+    return list.map((s) => s.trim()).filter(Boolean);
+  });
+
 const ConfigSchema = z
   .object({
-    captainName: z.string().optional().default(""),
+    // Single string or YAML list; normalized to string[] by CaptainNameSchema.
+    captainName: CaptainNameSchema,
     teamName: z.string().optional().default(""),
     day: z.string().min(1),
     league: z.string().min(1),
     leagueUrl: z.string().url(),
+    // xAI Grok model id (api.x.ai). Stagehand v4 has no native xAI provider;
+    // we call Grok through a BYO LLM callback (OpenAI-compatible client).
+    model: z.string().min(1).optional().default("grok-4-fast-reasoning"),
     schedulePathSuffix: z.string().optional().default("/schedule"),
   })
   .superRefine((val, ctx) => {
-    const hasCaptain = Boolean(val.captainName?.trim());
+    const hasCaptain = val.captainName.length > 0;
     const hasTeam = Boolean(val.teamName?.trim());
     if (!hasCaptain && !hasTeam) {
       ctx.addIssue({
         code: "custom",
         message:
-          "Set captainName (to discover team(s) by captain) and/or teamName (explicit team when captainName is empty).",
+          "Set captainName (string or list, to discover team(s) by captain) and/or teamName (explicit team when captainName is empty).",
         path: ["captainName"],
       });
     }
@@ -72,7 +86,7 @@ function loadConfig(): AppConfig {
     const why = err instanceof Error ? err.message : String(err);
     throw new ConfigError(
       `Missing or unreadable config.yaml at ${CONFIG_PATH} (${why}). ` +
-        `Copy config.example.yaml to config.yaml and edit captainName and/or teamName, day, league, and leagueUrl.`,
+        `Copy config.example.yaml to config.yaml and edit captainName (string or list) and/or teamName, day, league, and leagueUrl.`,
     );
   }
   let parsed: unknown;
@@ -89,7 +103,7 @@ function loadConfig(): AppConfig {
       .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
       .join("; ");
     throw new ConfigError(
-      `config.yaml is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional schedulePathSuffix).`,
+      `config.yaml is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional model, schedulePathSuffix).`,
     );
   }
   return result.data;
@@ -100,15 +114,24 @@ class MissingKeyError extends Error {}
 class ResolveError extends Error {}
 
 const config = loadConfig();
-const CAPTAIN_NAME = config.captainName?.trim() ?? "";
+/** Normalized list of captain queries (from string or list in config.yaml). */
+const CAPTAIN_NAMES: string[] = config.captainName;
 const CONFIG_TEAM_NAME = config.teamName?.trim() ?? "";
-/** Prefer captainName for discovery; fall back to teamName when captain is empty/absent. */
-const USE_CAPTAIN = CAPTAIN_NAME.length > 0;
+/** Prefer captainName for discovery; fall back to teamName when captain list is empty. */
+const USE_CAPTAIN = CAPTAIN_NAMES.length > 0;
 const LEAGUE_URL = config.leagueUrl.replace(/\/+$/, "");
 const SCHEDULE_URL = `${LEAGUE_URL}${config.schedulePathSuffix.startsWith("/") ? config.schedulePathSuffix : `/${config.schedulePathSuffix}`}`;
-const MODEL_NAME = (process.env.STAGEHAND_MODEL ?? "openai/gpt-5.6-luna") as ModelName;
+/** Default xAI Grok id (structured outputs + tool use). Override via config.model or STAGEHAND_MODEL. */
+const DEFAULT_GROK_MODEL = "grok-4-fast-reasoning";
+const XAI_BASE_URL = "https://api.x.ai/v1";
 const HEADLESS = process.env.HEADLESS !== "false";
 const OUTPUT_PATH = join(ROOT, "games.json");
+
+/** Resolve the Grok model id: STAGEHAND_MODEL > config.model > default. Strip optional "xai/" prefix. */
+function resolveGrokModelId(): string {
+  const raw = (process.env.STAGEHAND_MODEL?.trim() || config.model?.trim() || DEFAULT_GROK_MODEL);
+  return raw.toLowerCase().startsWith("xai/") ? raw.slice(4) : raw;
+}
 
 // ---- Schemas ---------------------------------------------------------------
 const GameSchema = z.object({
@@ -155,53 +178,165 @@ const StandingsSchema = z.object({
 type Game = z.infer<typeof GameSchema>;
 type StandingsRow = z.infer<typeof StandingsRowSchema>;
 
-function captainMatches(rowCaptain: string | undefined, wanted: string): boolean {
-  if (!rowCaptain || !wanted) return false;
-  const a = rowCaptain.toLowerCase().replace(/\s+/g, " ").trim();
-  const b = wanted.toLowerCase().replace(/\s+/g, " ").trim();
-  return a.includes(b) || b.includes(a);
+/** Lowercase, strip punctuation, collapse whitespace — so "R Baas" ≡ "R. Baas". */
+function normalizeCaptain(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
+
+function captainMatches(rowCaptain: string | undefined, wanted: string): boolean {
+  // Exact match after normalizing punctuation/case (token lists equal).
+  // "R. Baas" ≡ "R Baas"; "Robinson" does NOT match "H. Robinson".
+  if (!rowCaptain || !wanted) return false;
+  const a = normalizeCaptain(rowCaptain);
+  const b = normalizeCaptain(wanted);
+  if (!a || !b) return false;
+  return a === b;
+}
+
+type CaptainMatchDetail = {
+  query: string;
+  matchedTeams: StandingsRow[];
+};
 
 function resolveTeamsFromStandings(
   rows: StandingsRow[],
-): { matchedTeams: StandingsRow[]; resolution: "captain" | "teamName" } {
+): {
+  matchedTeams: StandingsRow[];
+  resolution: "captain" | "teamName";
+  captainMatchDetails: CaptainMatchDetail[];
+} {
   if (USE_CAPTAIN) {
-    const matched = rows.filter((r) => captainMatches(r.captainName, CAPTAIN_NAME));
+    const captainMatchDetails: CaptainMatchDetail[] = CAPTAIN_NAMES.map((query) => ({
+      query,
+      matchedTeams: rows.filter((r) => captainMatches(r.captainName, query)),
+    }));
+    // Deduplicate teams matched by any query (same team can match multiple aliases).
+    const seen = new Set<string>();
+    const matched: StandingsRow[] = [];
+    for (const detail of captainMatchDetails) {
+      for (const row of detail.matchedTeams) {
+        const key = row.teamName.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          matched.push(row);
+        }
+      }
+    }
     if (matched.length === 0) {
       const captains = rows
         .map((r) => r.captainName)
         .filter(Boolean)
         .join(", ");
+      const wanted = CAPTAIN_NAMES.map((n) => JSON.stringify(n)).join(", ");
       throw new ResolveError(
-        `No standings row matched captainName="${CAPTAIN_NAME}". Captains seen: ${captains || "(none extracted)"}.`,
+        `No standings row matched captainName=[${wanted}]. Captains seen: ${captains || "(none extracted)"}.`,
       );
     }
-    return { matchedTeams: matched, resolution: "captain" };
+    return { matchedTeams: matched, resolution: "captain", captainMatchDetails };
   }
 
+  // Exact case-insensitive match only — no substring / "partial" matches.
   const wanted = CONFIG_TEAM_NAME.toLowerCase();
   const matched = rows.filter((r) => r.teamName.toLowerCase() === wanted);
   if (matched.length === 0) {
-    // Fall back to case-insensitive substring if exact match fails.
-    const partial = rows.filter((r) => r.teamName.toLowerCase().includes(wanted));
-    if (partial.length === 0) {
-      const names = rows.map((r) => r.teamName).join(", ");
-      throw new ResolveError(
-        `No standings row matched teamName="${CONFIG_TEAM_NAME}". Teams seen: ${names || "(none extracted)"}.`,
-      );
-    }
-    return { matchedTeams: partial, resolution: "teamName" };
+    const names = rows.map((r) => r.teamName).join(", ");
+    throw new ResolveError(
+      `No standings row matched teamName="${CONFIG_TEAM_NAME}" (exact). Teams seen: ${names || "(none extracted)"}.`,
+    );
   }
-  return { matchedTeams: matched, resolution: "teamName" };
+  return { matchedTeams: matched, resolution: "teamName", captainMatchDetails: [] };
 }
 
 // ---- Setup helpers ---------------------------------------------------------
-function modelConfig() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (apiKey) return { modelName: MODEL_NAME, apiKey };
-  if (process.env.BROWSERBASE_API_KEY) return undefined; // Browserbase Model Gateway picks a model
+/**
+ * Stagehand v4 first-class providers are only openai/anthropic/google/groq/cerebras.
+ * xAI Grok is reached via the documented BYO LLM callback + OpenAI-compatible
+ * client pointed at https://api.x.ai/v1 (XAI_API_KEY). See:
+ * https://docs.stagehand.dev/v4/configuration/models (bring your own LLM /
+ * OpenAI-compatible SDKs) and https://docs.x.ai/docs/models.
+ *
+ * Params are typed loosely: the TS SDK does not re-export LLMGenerateParams, and
+ * the ClientLLM Zod schema includes tool_use blocks we don't need to model here.
+ */
+type GrokContentBlock = {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+};
+
+function messageContent(content: GrokContentBlock | GrokContentBlock[]) {
+  const blocks = Array.isArray(content) ? content : [content];
+  return blocks.map((block) => {
+    if (block.type === "text") {
+      return { type: "input_text" as const, text: block.text ?? "" };
+    }
+    if (block.type === "image") {
+      return {
+        type: "input_image" as const,
+        image_url: `data:${block.mimeType};base64,${block.data}`,
+        detail: "auto" as const,
+      };
+    }
+    // Ignore tool_use / tool_result blocks for structured extract/act calls.
+    return { type: "input_text" as const, text: "" };
+  });
+}
+
+function makeGrokGenerate(apiKey: string, modelId: string) {
+  const client = new OpenAI({ apiKey, baseURL: XAI_BASE_URL });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return async function generateWithGrok(params: any) {
+    if (params.responseFormat?.type !== "json_schema") {
+      throw new TypeError("Stagehand only issues structured generations");
+    }
+    const response = await client.responses.create({
+      model: modelId,
+      instructions: params.systemPrompt,
+      input: params.messages.map(
+        (message: { role: "user" | "assistant"; content: GrokContentBlock | GrokContentBlock[] }) => ({
+          role: message.role,
+          content: messageContent(message.content),
+        }),
+      ),
+      temperature: params.temperature,
+      text: {
+        format: {
+          type: "json_schema",
+          name: params.responseFormat.name,
+          schema: params.responseFormat.schema as Record<string, unknown>,
+          strict: true,
+        },
+      },
+    });
+    return {
+      role: "assistant" as const,
+      content: { type: "text" as const, text: response.output_text },
+      outputFormat: "json_schema" as const,
+      structuredContent: JSON.parse(response.output_text),
+    };
+  };
+}
+
+/** Build Stagehand.create({ model }) — Grok BYO callback, or Gateway when only BB key is set. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function modelConfig(): { generate: (params: any) => Promise<any> } | undefined {
+  const apiKey = process.env.XAI_API_KEY?.trim();
+  if (apiKey) {
+    const modelId = resolveGrokModelId();
+    log(`LLM: xAI Grok model="${modelId}" via ${XAI_BASE_URL}`);
+    return { generate: makeGrokGenerate(apiKey, modelId) };
+  }
+  if (process.env.BROWSERBASE_API_KEY) {
+    // Omit model — Browserbase Model Gateway picks one.
+    return undefined;
+  }
   throw new MissingKeyError(
-    "OPENAI_API_KEY is not set. Export it, or put it in .env and run `pnpm scrape:env`. " +
+    "XAI_API_KEY is not set. Export it, or put it in .env and run `pnpm scrape:env`. " +
       "Alternatively set BROWSERBASE_API_KEY to use a Browserbase cloud browser + Model Gateway.",
   );
 }
@@ -233,7 +368,7 @@ function gamesSchemaFor(teamNames: string[]) {
 async function main() {
   if (USE_CAPTAIN) {
     log(
-      `Config: captain="${CAPTAIN_NAME}"` +
+      `Config: captains=${JSON.stringify(CAPTAIN_NAMES)}` +
         (CONFIG_TEAM_NAME ? ` (config teamName="${CONFIG_TEAM_NAME}" ignored while captainName is set)` : "") +
         ` day="${config.day}" league="${config.league}"`,
     );
@@ -262,13 +397,25 @@ async function main() {
         StandingsSchema,
       );
 
-      const { matchedTeams, resolution } = resolveTeamsFromStandings(standings.rows ?? []);
+      const { matchedTeams, resolution, captainMatchDetails } = resolveTeamsFromStandings(standings.rows ?? []);
       const teamNames = matchedTeams.map((t) => t.teamName);
       log(
         `Resolved via ${resolution}: ${matchedTeams
           .map((t) => `"${t.teamName}" (captain=${t.captainName ?? "?"})`)
           .join(", ")}`,
       );
+      for (const detail of captainMatchDetails) {
+        if (detail.matchedTeams.length === 0) {
+          log(`  captain query ${JSON.stringify(detail.query)}: no team matched`);
+        } else {
+          log(
+            `  captain query ${JSON.stringify(detail.query)}: ` +
+              detail.matchedTeams
+                .map((t) => `"${t.teamName}" (captain=${t.captainName ?? "?"})`)
+                .join(", "),
+          );
+        }
+      }
 
       // 2) Schedule page: click through each week tab and extract that week's games for matched teams.
       log(`Opening schedule: ${SCHEDULE_URL}`);
@@ -326,7 +473,18 @@ async function main() {
       }
 
       const output = {
-        captainSearched: USE_CAPTAIN ? CAPTAIN_NAME : null,
+        captainSearched: USE_CAPTAIN ? (CAPTAIN_NAMES.length === 1 ? CAPTAIN_NAMES[0] : CAPTAIN_NAMES) : null,
+        captainMatchDetails: USE_CAPTAIN
+          ? captainMatchDetails.map((d) => ({
+              query: d.query,
+              matchedTeams: d.matchedTeams.map((t) => ({
+                teamName: t.teamName,
+                captainName: t.captainName,
+                record: t.record,
+                standing: t.standing,
+              })),
+            }))
+          : undefined,
         resolution,
         matchedTeams: matchedTeams.map((t) => ({
           teamName: t.teamName,
