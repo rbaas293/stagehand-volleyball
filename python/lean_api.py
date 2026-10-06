@@ -13,7 +13,6 @@ https://flan1-lms-pub-api.league.ninja with endpoints:
 from __future__ import annotations
 
 import json
-import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone

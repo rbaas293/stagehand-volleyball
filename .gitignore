@@ -1,17 +1,35 @@
-node_modules/
+# Secrets / local env (keep .env.example)
 .env
 .env.*
 !.env.example
+
+# Scraper output
 games.json
-chrome-user-data/
+python/games.json
+
 # Python
 python/.venv/
 python/venv/
+.venv/
+venv/
 **/__pycache__/
 *.py[cod]
-python/games.json
-# Config: config.yaml (shared by TS + Python) is tracked on purpose.
-# The old JSON config was replaced by YAML; ignore stale local copies.
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.pyz
+
+# Browser leftovers
+chrome-user-data/
+
+# Stale JSON config (migrated to YAML)
 config.json
 config.example.json
 python/config.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

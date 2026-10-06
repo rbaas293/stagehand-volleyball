@@ -1,4 +1,4 @@
-# stagehand-volleyball config (shared by the TypeScript scraper and python/).
+# stagehand-volleyball config (repo root; consumed by python/main.py).
 #
 # Template: config.example.yaml
 #

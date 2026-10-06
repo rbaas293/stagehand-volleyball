@@ -1,4 +1,4 @@
-# stagehand-volleyball config (shared by the TypeScript scraper and python/).
+# stagehand-volleyball config (repo root; consumed by python/main.py).
 #
 # Copy this file to config.yaml and edit it:
 #   cp config.example.yaml config.yaml

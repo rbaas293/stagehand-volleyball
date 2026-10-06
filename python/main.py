@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Stagehand v4 (Python) scraper: volleyball game times for a team (or captain) on league.ninja.
+Stagehand / lean scraper: volleyball game times for a team (or captain) on league.ninja.
 
-This mirrors the TypeScript scraper in ../index.ts:
-  1. Load config.yaml (captainName / teamName / day / league / leagueUrl).
-  2. Launch a local Chrome browser (or Browserbase cloud browser).
-  3. Open standings → extract rows with pydantic → resolve team(s) by captain or team name.
-  4. Open schedule → click each week tab (exact text, act() fallback), verify it is
-     selected → extract() that week's games.
+Modes (config.mode / SCRAPE_MODE):
+  lean — public LMS HTTP API (no browser / no LLM)
+  llm  — Stagehand v4 browser extract with xAI Grok BYO callback
+
+Flow (llm):
+  1. Load config.yaml (captainName / teamName / levels / leagueUrl / …).
+  2. Launch local Chrome (or Browserbase).
+  3. Standings → extract → resolve team(s) by captain or team name.
+  4. Schedule → click each week tab → extract that week's games.
   5. Write games.json next to this script (and print JSON to stdout).
 
 Run (from this folder):
@@ -22,7 +25,7 @@ Env:
   STAGEHAND_MODEL      optional, overrides config.yaml model (default "grok-4-fast-reasoning")
   HEADLESS=false       optional: show the local Chrome window
 
-Config resolution (same as TypeScript):
+Config resolution:
   - If captainName is set (non-empty), discover team(s) on the standings page whose
     captain matches (case-insensitive, partial OK: "Robinson" matches "H. Robinson"),
     then scrape all games for those team name(s).
@@ -36,15 +39,15 @@ league.ninja layout (as of Oct 2026):
 from __future__ import annotations
 
 # ---- Standard library -------------------------------------------------------
-import asyncio          # Stagehand's Python API is async; we drive it with asyncio.run()
-import json             # Serialize games.json (and the team-name list passed to the page)
-import os               # Read env vars (XAI_API_KEY, HEADLESS, …)
-import re               # Match week-tab labels (Week / TOURNAMENT / …)
-import sys              # Exit codes + stderr logging
-from urllib.parse import urlparse        # Validate leagueUrl is a real http(s) URL
+import asyncio  # Stagehand's Python API is async; we drive it with asyncio.run()
+import json  # Serialize games.json (and the team-name list passed to the page)
+import os  # Read env vars (XAI_API_KEY, HEADLESS, …)
+import re  # Match week-tab labels (Week / TOURNAMENT / …)
+import sys  # Exit codes + stderr logging
 from datetime import datetime, timezone  # scrapedAt timestamp (UTC ISO-8601)
-from pathlib import Path                 # Config / output paths without string concat
-from typing import Any, Literal          # Typing for status enum + loose YAML/JSON bits
+from pathlib import Path  # Config / output paths without string concat
+from typing import Any, Literal  # Typing for status enum + loose YAML/JSON bits
+from urllib.parse import urlparse  # Validate leagueUrl is a real http(s) URL
 
 # ---- Third-party ------------------------------------------------------------
 import yaml  # PyYAML: parse config.yaml (safe_load only — plain data, never arbitrary objects)
@@ -55,7 +58,6 @@ from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local
 # ---- Local helpers (lean HTTP API + LLM token accounting) -------------------
 from lean_api import (
     LeanApiError,
-    division_url as lean_division_url,
     filter_divisions_by_levels,
     games_for_teams,
     get_schedule_v2,
@@ -65,6 +67,9 @@ from lean_api import (
     list_seasons,
     pick_current_season,
     standing_row_from_api,
+)
+from lean_api import (
+    division_url as lean_division_url,
 )
 from token_usage import USAGE, reset_usage
 
@@ -85,7 +90,7 @@ OUTPUT_PATH = ROOT / "games.json"
 
 
 # ---------------------------------------------------------------------------
-# Errors (matched to the TypeScript ConfigError / MissingKeyError / ResolveError)
+# Errors 
 # ---------------------------------------------------------------------------
 class ConfigError(Exception):
     """Raised when config.yaml is missing, unreadable, not valid YAML, or fails validation."""
@@ -143,7 +148,7 @@ def describe_error(err: BaseException) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Config model (mirrors ConfigSchema in index.ts)
+# Config model
 # ---------------------------------------------------------------------------
 class AppConfig(BaseModel):
     """User-editable knobs loaded from config.yaml."""
@@ -233,7 +238,7 @@ class AppConfig(BaseModel):
         return stripped
 
     @model_validator(mode="after")
-    def require_captain_or_team_and_target(self) -> "AppConfig":
+    def require_captain_or_team_and_target(self) -> AppConfig:
         """Captain/team required; need leagueUrl and/or levels[] for what to scrape."""
         has_captain = len(self.captain_name) > 0
         has_team = bool(self.team_name.strip())
@@ -450,7 +455,7 @@ def normalize_captain(s: str) -> str:
 
 def captain_matches(row_captain: str | None, wanted: str) -> bool:
     """
-    Case- and punctuation-insensitive partial match (same as index.ts).
+    Case- and punctuation-insensitive partial match (case- and punctuation-insensitive).
     "Robinson" matches "H. Robinson"; "R Baas" matches "R. Baas".
     """
     if not row_captain or not wanted:
@@ -711,7 +716,7 @@ def normalize_tab_label(text: str) -> str:
 
 async def click_tab_by_exact_text(page, label: str) -> bool:
     """
-    Deterministic click, same as the TypeScript scraper: find the role=tab
+    Deterministic click, deterministic DOM click: find the role=tab
     whose whitespace-normalized innerText equals `label` and click() it.
 
     Returns True if a matching tab element was found (and clicked), else False.
@@ -784,7 +789,7 @@ async def click_week_tab(stagehand: Stagehand, page, label: str) -> None:
     [role=tab][aria-selected=true] text == label before returning.
 
     Strategy per attempt:
-      1. Exact-text DOM click (same as the TypeScript version): fast, no LLM.
+      1. Exact-text DOM click (deterministic): fast, no LLM.
       2. If the tab still isn't selected, fall back to stagehand.act()
          (natural-language click), which survives DOM changes where the tab
          text/markup no longer matches exactly. We also check act()'s own

@@ -1,5 +1,5 @@
 # Stagehand v4 Python SDK (act / extract / observe + local Chrome / Browserbase).
-# Pin to the same major as the TypeScript package (@browserbasehq/stagehand ^4.1.0).
+# Pin Stagehand v4 (same major as historically used in this repo).
 stagehand==4.1.0
 
 # Pydantic is pulled in by stagehand; listed explicitly because our schemas use it.

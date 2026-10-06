@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Published xAI rates for grok-4-fast-* (<128k): $0.20 / 1M input, $0.50 / 1M output.
 # (docs.x.ai / x.ai/news/grok-4-fast). Other models fall back to these conservative rates
 # unless listed below. Retirement (May 2026) may redirect fast slugs to grok-4.3 pricing.
