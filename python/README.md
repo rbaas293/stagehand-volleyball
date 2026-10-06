@@ -14,6 +14,7 @@ See the [root README](../README.md) for config, modes, and environment variables
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env               # or reuse the repo-root .env
+cp ../config.example.yaml ../config.yaml   # once; gitignored
 # edit ../config.yaml — captainName / levels / mode / …
 export XAI_API_KEY=...             # llm mode only, if not using .env
 python main.py                     # lean by default

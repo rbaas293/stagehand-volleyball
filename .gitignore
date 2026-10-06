@@ -24,7 +24,7 @@ build/
 # Browser leftovers
 chrome-user-data/
 
-# Stale JSON config (migrated to YAML); config.yaml is tracked on purpose.
+# Stale JSON config (migrated to YAML)
 config.json
 config.example.json
 python/config.json
@@ -36,3 +36,7 @@ python/config.json
 
 # Leftover local Node installs (TS removed)
 node_modules/
+
+# Local scraper config (copy from config.example.yaml). Do not commit personal names/URLs.
+config.yaml
+python/config.yaml

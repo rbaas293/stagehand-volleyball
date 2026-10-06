@@ -25,7 +25,8 @@ Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Single-division `
 
 | Path | Role |
 |---|---|
-| `config.yaml` / `config.example.yaml` | Shared config at **repo root** |
+| `config.example.yaml` | Public template at **repo root** (copy → local `config.yaml`) |
+| `config.yaml` | Local only (gitignored) |
 | `python/main.py` | CLI entrypoint |
 | `python/lean_api.py` | Pub-api client (lean mode) |
 | `python/token_usage.py` | xAI token / cost accumulator |
@@ -36,10 +37,15 @@ The scraper code stays under **`python/`** (not moved to repo root) so existing 
 
 ## Config
 
+`config.yaml` is **local only** (gitignored). Start from the public template:
+
 ```bash
 cp config.example.yaml config.yaml
 # edit captainName / levels / siteUrl / mode / …
 ```
+
+If `config.yaml` is missing, the scraper exits with an error that includes that `cp` hint — it does **not** fall back to the example file.
+
 
 | Field | Required | Purpose |
 |---|---|---|
@@ -47,7 +53,7 @@ cp config.example.yaml config.yaml
 | `teamName` | one of captain/team | Used only when `captainName` is empty. |
 | `mode` | no | `lean` (default) or `llm`. |
 | `levels` | no | Name substrings for multi-div discovery (e.g. `Beer A`, `Beer B`). |
-| `siteUrl` | with levels | Club origin, e.g. `https://flannagans.league.ninja`. |
+| `siteUrl` | with levels | Club origin, e.g. `https://example.league.ninja`. |
 | `apiBaseUrl` | no | Override pub API base (inferred for known clubs). |
 | `leagueUrl` | single-div | Division URL when `levels` is empty. |
 | `day` / `league` | no | Notes for single-div; multi-div uses API fields. |

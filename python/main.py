@@ -81,7 +81,14 @@ ROOT = Path(__file__).resolve().parent
 # Prefer the shared repo-root config.yaml; fall back to python/config.yaml.
 PARENT_CONFIG = ROOT.parent / "config.yaml"
 LOCAL_CONFIG = ROOT / "config.yaml"
-CONFIG_PATH = PARENT_CONFIG if PARENT_CONFIG.is_file() else LOCAL_CONFIG
+# Prefer repo-root config.yaml when present; else python/config.yaml.
+# If neither exists, keep PARENT_CONFIG so the missing-file error points at the
+# documented location (repo root) rather than the python/ fallback path.
+CONFIG_PATH = (
+    PARENT_CONFIG
+    if PARENT_CONFIG.is_file() or not LOCAL_CONFIG.is_file()
+    else LOCAL_CONFIG
+)
 
 # Output lands next to this script (python/games.json).
 OUTPUT_PATH = ROOT / "games.json"
@@ -308,8 +315,10 @@ def load_config() -> AppConfig:
     except OSError as err:
         raise ConfigError(
             f"Missing or unreadable config.yaml at {CONFIG_PATH} ({err}). "
-            "Copy config.example.yaml to config.yaml at the repo root and edit "
-            "captainName and/or teamName, day, league, and leagueUrl."
+            "Create one with: cp config.example.yaml config.yaml "
+            "(from the repo root), then edit captainName and/or teamName, "
+            "levels / siteUrl (or leagueUrl), and related fields. "
+            "The scraper does not fall back to config.example.yaml."
         ) from err
 
     try:

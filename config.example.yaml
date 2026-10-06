@@ -1,34 +1,52 @@
-# stagehand-volleyball config (repo root; consumed by python/main.py).
+# stagehand-volleyball config template.
 #
-# Copy this file to config.yaml and edit it:
+# Copy to a local (gitignored) config.yaml and edit:
 #   cp config.example.yaml config.yaml
 #
 # You must set at least one of captainName or teamName.
 # Keep string values in double quotes so characters like ":" or "#" are never misread.
 
+# Captain(s) to search for on the standings page (preferred discovery path).
+# Accepts a single string OR a YAML list. Case- and punctuation-insensitive
+# partial match ("Smith" matches "J. Smith"; "R Baas" matches "R. Baas").
+#
+# Single-string form (still supported):
+#   captainName: "J. Smith"
 captainName:
-  - "H. Robinson"
-  - "Ryan Baas"
-  - "R. Baas"
-  - "R Baas"
+  - "J. Smith"
 
-teamName: "Win or Lose We Booze"
+# Explicit team name. Used only when captainName is empty/absent.
+teamName: "Example Team"
 
-# lean = pub-api HTTP (no LLM); llm = Stagehand extract. Override: SCRAPE_MODE=lean|llm
+# Scraping mode:
+#   lean — club pub API (HTTP) for division list / standings / schedules (no LLM)
+#   llm  — Stagehand LLM extract on standings + each schedule week
+# Override at runtime with SCRAPE_MODE=lean|llm.
 mode: "lean"
 
-# Multi-division: every division whose league/division name contains any substring.
+# Multi-division filter: scrape every division whose league/division name contains
+# any of these substrings (case-insensitive), for the current season.
+# When non-empty, leagueUrl is optional.
 levels:
   - "Beer A"
   - "Beer B"
 
-siteUrl: "https://flannagans.league.ninja"
+# Club site origin (used to build division URLs and infer the pub API host).
+siteUrl: "https://example.league.ninja"
 
+# Optional explicit pub API base (otherwise inferred for known clubs from siteUrl/leagueUrl).
+# apiBaseUrl: "https://example-lms-pub-api.league.ninja"
+
+# Game-day / league notes (single-division). Optional when levels[] is set.
 day: "Sunday"
-league: "Summer III- 2026 › Beer A / Beer B (all days)"
+league: "Example Season › Example League › Example Division"
 
-# Single-division URL (back-compat when levels is empty); also helps infer apiBaseUrl.
-leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
+# Single-division standings URL (backward compatible when levels is empty).
+# Also helps infer apiBaseUrl when siteUrl is omitted.
+leagueUrl: "https://example.league.ninja/leagues/division/00000000-0000-0000-0000-000000000000"
 
+# xAI Grok model id for Stagehand extract/act (llm mode). Override with STAGEHAND_MODEL.
 model: "grok-4-fast-reasoning"
+
+# Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
 schedulePathSuffix: "/schedule"
