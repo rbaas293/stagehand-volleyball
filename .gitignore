@@ -33,3 +33,6 @@ python/config.json
 .DS_Store
 .idea/
 .vscode/
+
+# Leftover local Node installs (TS removed)
+node_modules/
