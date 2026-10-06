@@ -37,8 +37,10 @@ siteUrl: "https://example.league.ninja"
 # Optional explicit pub API base (otherwise inferred for known clubs from siteUrl/leagueUrl).
 # apiBaseUrl: "https://example-lms-pub-api.league.ninja"
 
-# Optional: force a season by exact name or uid. When empty, pick the active
-# season by date (in-range preferred; else latest startDate).
+# Optional season override (exact name, substring, or uid). When empty, auto-pick
+# prefers an in-range season that has divisions matching levels[] above — so a
+# newer empty overlap (e.g. Fall 2026 with no Beer A/B yet) does not win over
+# Summer III. Force a season if auto-pick is wrong:
 # season: "Summer III- 2026"
 
 # Game-day / league notes (single-division). Optional when levels[] is set.

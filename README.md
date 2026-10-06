@@ -13,7 +13,7 @@ Default config searches captains **H. Robinson** / **R. Baas** / **Ryan Baas** a
 
 Set in `config.yaml` (`mode: lean|llm`) or override with `SCRAPE_MODE`.
 
-Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Single-division `leagueUrl` still works when `levels` is empty.
+Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers an **active/in-range season that has divisions matching those levels** (so a newer empty overlap like Fall does not win over Summer III). Set `season` to force a name or uid. Single-division `leagueUrl` still works when `levels` is empty.
 
 ## Requirements
 
@@ -49,12 +49,13 @@ If `config.yaml` is missing, the scraper exits with an error that includes that 
 
 | Field | Required | Purpose |
 |---|---|---|
-| `captainName` | one of captain/team | String or YAML list. Case- and punctuation-insensitive (`"R Baas"` ≡ `"R. Baas"`). |
-| `teamName` | one of captain/team | Used only when `captainName` is empty. |
+| `captainName` | one of captain/team | String or YAML list. Exact after normalizing punctuation/case (`"R Baas"` ≡ `"R. Baas"`; no substrings). |
+| `teamName` | one of captain/team | Exact match; used only when `captainName` is empty. |
 | `mode` | no | `lean` (default) or `llm`. |
 | `levels` | no | Name substrings for multi-div discovery (e.g. `Beer A`, `Beer B`). |
 | `siteUrl` | with levels | Club origin, e.g. `https://example.league.ninja`. |
 | `apiBaseUrl` | no | Override pub API base (inferred for known clubs). |
+| `season` | no | Optional season **name or uid** override. When empty, auto-pick prefers in-range seasons that have divisions matching `levels` (falls back if the newest overlap has none). |
 | `leagueUrl` | single-div | Division URL when `levels` is empty. |
 | `day` / `league` | no | Notes for single-div; multi-div uses API fields. |
 | `model` | no | xAI Grok id (default `grok-4-fast-reasoning`). |
@@ -89,4 +90,8 @@ Stdout is JSON; also writes `python/games.json`. Null keys are omitted; `scraped
 
 ## Team resolution
 
-Prefer `captainName` (any list entry); else `teamName`. Multi-div: a miss in one division is OK — failure only if nothing matches across all scanned divisions.
+Prefer `captainName` (exact after normalizing punctuation/case); else exact `teamName`. Multi-div: a miss in one division is OK — failure only if nothing matches across all scanned divisions. Resolve errors name the season scanned and hint at the `season` config override.
+
+## License
+
+Private / personal use unless otherwise noted.

@@ -68,6 +68,7 @@ from lean_api import (
     list_season_divisions,
     list_seasons,
     pick_current_season,
+    pick_season_for_levels,
     standing_row_from_api,
 )
 from token_usage import USAGE, reset_usage
@@ -184,7 +185,8 @@ class AppConfig(BaseModel):
     # Optional override for the LMS pub API base. Inferred for known clubs from siteUrl/leagueUrl.
     api_base_url: str = Field(default="", alias="apiBaseUrl")
     # Optional season name or uid override for multi-div discovery (lean/llm).
-    # When empty, the scraper picks the active season by date deterministically.
+    # When empty, pick an in-range season that has divisions matching levels[]
+    # (skips empty overlaps like Fall before Beer leagues exist).
     season: str = Field(default="")
 
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
@@ -974,12 +976,17 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
         league_url=config.league_url or None,
     )
     seasons = list_seasons(api_base)
-    season = pick_current_season(seasons, season=config.season or None)
+    season, matched, reason = pick_season_for_levels(
+        api_base,
+        seasons,
+        levels,
+        season=config.season or None,
+        log_fn=log,
+    )
     season_uid = season["uid"]
     season_name = season.get("name") or ""
     log(f"Lean/API discovery: api={api_base} season={season_name!r} ({season_uid})")
-    all_divs = list_season_divisions(api_base, season_uid)
-    matched = filter_divisions_by_levels(all_divs, levels)
+    log(f"  reason: {reason}")
     site = (config.site_url or config.league_url or "https://flannagans.league.ninja").strip()
     out: list[dict[str, Any]] = []
     for d in matched:
@@ -991,7 +998,7 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
                 "singleDivision": False,
             }
         )
-    log(f"levels={levels!r}: {len(out)}/{len(all_divs)} divisions matched")
+    log(f"levels={levels!r}: {len(out)} division(s) matched in {season_name!r}")
     return season_name, out
 
 
@@ -1170,15 +1177,20 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             games.append(g)
         log(f"    -> {len(div_games)} game(s)")
 
+    season_hint = (
+        f' Season scanned: {season_name or "(unknown)"}. '
+        f'If this is the wrong season (e.g. Fall with no Beer A/B), set config '
+        f'season to a name or uid (see config.example.yaml), e.g. season: "Summer III- 2026".'
+    )
     if use_captain and not all_matched_teams:
         raise ResolveError(
             f"No standings row matched captainName={json.dumps(captain_names)} "
-            f"across {len(divisions_scanned)} division(s)."
+            f"across {len(divisions_scanned)} division(s).{season_hint}"
         )
     if not use_captain and not all_matched_teams:
         raise ResolveError(
             f'No standings row matched teamName="{config_team_name}" '
-            f"across {len(divisions_scanned)} division(s)."
+            f"across {len(divisions_scanned)} division(s).{season_hint}"
         )
 
     elapsed = time.perf_counter() - t0
@@ -1524,15 +1536,20 @@ async def scrape_llm(config: AppConfig) -> dict[str, Any]:
                     all_games.append(gd)
                 rounds_without.extend(partial.get("roundsWithoutTeamGames") or [])
 
+            season_hint = (
+                f' Season scanned: {season_name or "(unknown)"}. '
+                f'If this is the wrong season (e.g. Fall with no Beer A/B), set config '
+                f'season to a name or uid (see config.example.yaml), e.g. season: "Summer III- 2026".'
+            )
             if use_captain and not all_matched:
                 raise ResolveError(
                     f"No standings row matched captainName={json.dumps(captain_names)} "
-                    f"across {len(divisions_scanned)} division(s)."
+                    f"across {len(divisions_scanned)} division(s).{season_hint}"
                 )
             if not use_captain and not all_matched:
                 raise ResolveError(
                     f'No standings row matched teamName="{config_team_name}" '
-                    f"across {len(divisions_scanned)} division(s)."
+                    f"across {len(divisions_scanned)} division(s).{season_hint}"
                 )
 
             elapsed = time.perf_counter() - t0
