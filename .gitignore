@@ -24,7 +24,7 @@ build/
 # Browser leftovers
 chrome-user-data/
 
-# Stale JSON config (migrated to YAML)
+# Stale JSON config (migrated to YAML); config.yaml is tracked on purpose.
 config.json
 config.example.json
 python/config.json
