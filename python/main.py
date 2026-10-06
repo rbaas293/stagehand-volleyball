@@ -3,7 +3,7 @@
 Stagehand v4 (Python) scraper: volleyball game times for a team (or captain) on league.ninja.
 
 This mirrors the TypeScript scraper in ../index.ts:
-  1. Load config (captainName / teamName / day / league / leagueUrl).
+  1. Load config.yaml (captainName / teamName / day / league / leagueUrl).
   2. Launch a local Chrome browser (or Browserbase cloud browser).
   3. Open standings → extract rows with pydantic → resolve team(s) by captain or team name.
   4. Open schedule → click each week tab (exact text, act() fallback), verify it is
@@ -37,16 +37,17 @@ from __future__ import annotations
 
 # ---- Standard library -------------------------------------------------------
 import asyncio          # Stagehand's Python API is async; we drive it with asyncio.run()
-import json             # Parse config.json and serialize games.json
+import json             # Serialize games.json (and the team-name list passed to the page)
 import os               # Read env vars (OPENAI_API_KEY, HEADLESS, …)
 import re               # Match week-tab labels (Week / TOURNAMENT / …)
 import sys              # Exit codes + stderr logging
 from urllib.parse import urlparse        # Validate leagueUrl is a real http(s) URL
 from datetime import datetime, timezone  # scrapedAt timestamp (UTC ISO-8601)
 from pathlib import Path                 # Config / output paths without string concat
-from typing import Any, Literal          # Typing for status enum + loose JSON bits
+from typing import Any, Literal          # Typing for status enum + loose YAML/JSON bits
 
 # ---- Third-party ------------------------------------------------------------
+import yaml  # PyYAML: parse config.yaml (safe_load only — plain data, never arbitrary objects)
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from stagehand import Stagehand, browserbase, local_browser
 
@@ -56,10 +57,10 @@ from stagehand import Stagehand, browserbase, local_browser
 # Directory that contains this script (python/).
 ROOT = Path(__file__).resolve().parent
 
-# Prefer the shared repo-root config so one config.json drives both TS and Python.
-# Fall back to python/config.json if someone wants a Python-only override.
-PARENT_CONFIG = ROOT.parent / "config.json"
-LOCAL_CONFIG = ROOT / "config.json"
+# Prefer the shared repo-root config so one config.yaml drives both TS and Python.
+# Fall back to python/config.yaml if someone wants a Python-only override.
+PARENT_CONFIG = ROOT.parent / "config.yaml"
+LOCAL_CONFIG = ROOT / "config.yaml"
 CONFIG_PATH = PARENT_CONFIG if PARENT_CONFIG.is_file() else LOCAL_CONFIG
 
 # Output lands next to this script so TS games.json and Python games.json don't clash.
@@ -70,7 +71,7 @@ OUTPUT_PATH = ROOT / "games.json"
 # Errors (matched to the TypeScript ConfigError / MissingKeyError / ResolveError)
 # ---------------------------------------------------------------------------
 class ConfigError(Exception):
-    """Raised when config.json is missing, unreadable, or fails validation."""
+    """Raised when config.yaml is missing, unreadable, not valid YAML, or fails validation."""
 
 
 class MissingKeyError(Exception):
@@ -109,7 +110,7 @@ def describe_error(err: BaseException) -> str:
 # Config model (mirrors ConfigSchema in index.ts)
 # ---------------------------------------------------------------------------
 class AppConfig(BaseModel):
-    """User-editable knobs loaded from config.json."""
+    """User-editable knobs loaded from config.yaml."""
 
     # Captain to search for on the standings page (preferred discovery path).
     captain_name: str = Field(default="", alias="captainName")
@@ -126,7 +127,7 @@ class AppConfig(BaseModel):
     # Path appended to leagueUrl to reach the schedule tab (default "/schedule").
     schedule_path_suffix: str = Field(default="/schedule", alias="schedulePathSuffix")
 
-    # Allow reading camelCase JSON keys while exposing snake_case attributes in Python.
+    # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
 
     @field_validator("league_url")
@@ -167,7 +168,7 @@ def load_dotenv_files() -> None:
     only fills in whatever is still missing.
     """
     # Try python-dotenv if installed; otherwise do a tiny manual parser so the
-    # scraper still works with only `pip install stagehand`.
+    # scraper still works without python-dotenv (only stagehand + PyYAML needed).
     # Order matters: python/.env before ../.env (see precedence above).
     candidates = [ROOT / ".env", ROOT.parent / ".env"]
     try:
@@ -198,20 +199,23 @@ def load_dotenv_files() -> None:
 
 
 def load_config() -> AppConfig:
-    """Read and validate config.json (parent preferred, then python/config.json)."""
+    """Read and validate config.yaml (parent preferred, then python/config.yaml)."""
     try:
         raw = CONFIG_PATH.read_text(encoding="utf-8")
     except OSError as err:
         raise ConfigError(
-            f"Missing or unreadable config.json at {CONFIG_PATH} ({err}). "
-            "Copy config.example.json to config.json at the repo root and edit "
+            f"Missing or unreadable config.yaml at {CONFIG_PATH} ({err}). "
+            "Copy config.example.yaml to config.yaml at the repo root and edit "
             "captainName and/or teamName, day, league, and leagueUrl."
         ) from err
 
     try:
-        parsed: Any = json.loads(raw)
-    except json.JSONDecodeError as err:
-        raise ConfigError(f"config.json is not valid JSON: {err}") from err
+        # safe_load (never yaml.load) builds only plain dicts / lists / strings /
+        # numbers, so a config file can't construct arbitrary Python objects.
+        # Comments in the YAML are simply ignored.
+        parsed: Any = yaml.safe_load(raw)
+    except yaml.YAMLError as err:
+        raise ConfigError(f"config.yaml is not valid YAML: {err}") from err
 
     try:
         return AppConfig.model_validate(parsed)
@@ -222,7 +226,7 @@ def load_config() -> AppConfig:
             for e in err.errors()
         )
         raise ConfigError(
-            f"config.json is invalid: {details}. Expected day, league, leagueUrl, "
+            f"config.yaml is invalid: {details}. Expected day, league, leagueUrl, "
             "plus captainName and/or teamName (and optional schedulePathSuffix)."
         ) from err
 
