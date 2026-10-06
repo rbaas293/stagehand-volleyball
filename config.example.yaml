@@ -24,6 +24,10 @@ levels:
 
 siteUrl: "https://flannagans.league.ninja"
 
+# Optional: force a season by exact name or uid. When empty, pick the active
+# season by date (in-range preferred; else latest startDate).
+# season: "Summer III- 2026"
+
 day: "Sunday"
 league: "Summer III- 2026 › Beer A / Beer B (all days)"
 

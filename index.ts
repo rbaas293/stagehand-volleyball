@@ -11,7 +11,7 @@
  *
  * Resolution:
  *   - If captainName is set (non-empty), discover team(s) on the standings page whose
- *     captain matches (case-insensitive, partial OK: "Robinson" matches "H. Robinson"),
+ *     captain matches (exact after normalizing punctuation/case: "R. Baas" ≡ "R Baas"),
  *     then scrape all games for those team name(s).
  *   - If captainName is empty/absent, use teamName as an explicit team override.
  *
@@ -188,11 +188,13 @@ function normalizeCaptain(s: string): string {
 }
 
 function captainMatches(rowCaptain: string | undefined, wanted: string): boolean {
+  // Exact match after normalizing punctuation/case (token lists equal).
+  // "R. Baas" ≡ "R Baas"; "Robinson" does NOT match "H. Robinson".
   if (!rowCaptain || !wanted) return false;
   const a = normalizeCaptain(rowCaptain);
   const b = normalizeCaptain(wanted);
   if (!a || !b) return false;
-  return a === b || a.includes(b) || b.includes(a);
+  return a === b;
 }
 
 type CaptainMatchDetail = {
@@ -237,18 +239,14 @@ function resolveTeamsFromStandings(
     return { matchedTeams: matched, resolution: "captain", captainMatchDetails };
   }
 
+  // Exact case-insensitive match only — no substring / "partial" matches.
   const wanted = CONFIG_TEAM_NAME.toLowerCase();
   const matched = rows.filter((r) => r.teamName.toLowerCase() === wanted);
   if (matched.length === 0) {
-    // Fall back to case-insensitive substring if exact match fails.
-    const partial = rows.filter((r) => r.teamName.toLowerCase().includes(wanted));
-    if (partial.length === 0) {
-      const names = rows.map((r) => r.teamName).join(", ");
-      throw new ResolveError(
-        `No standings row matched teamName="${CONFIG_TEAM_NAME}". Teams seen: ${names || "(none extracted)"}.`,
-      );
-    }
-    return { matchedTeams: partial, resolution: "teamName", captainMatchDetails: [] };
+    const names = rows.map((r) => r.teamName).join(", ");
+    throw new ResolveError(
+      `No standings row matched teamName="${CONFIG_TEAM_NAME}" (exact). Teams seen: ${names || "(none extracted)"}.`,
+    );
   }
   return { matchedTeams: matched, resolution: "teamName", captainMatchDetails: [] };
 }

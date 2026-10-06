@@ -24,7 +24,7 @@ Env:
 
 Config resolution (same as TypeScript):
   - If captainName is set (non-empty), discover team(s) on the standings page whose
-    captain matches (case-insensitive, partial OK: "Robinson" matches "H. Robinson"),
+    captain matches (exact after normalizing punctuation/case: "R. Baas" ≡ "R Baas"),
     then scrape all games for those team name(s).
   - If captainName is empty/absent, use teamName as an explicit team override.
 
@@ -173,6 +173,9 @@ class AppConfig(BaseModel):
     site_url: str = Field(default="", alias="siteUrl")
     # Optional override for the LMS pub API base. Inferred for known clubs from siteUrl/leagueUrl.
     api_base_url: str = Field(default="", alias="apiBaseUrl")
+    # Optional season name or uid override for multi-div discovery (lean/llm).
+    # When empty, the scraper picks the active season by date deterministically.
+    season: str = Field(default="")
 
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
@@ -450,8 +453,10 @@ def normalize_captain(s: str) -> str:
 
 def captain_matches(row_captain: str | None, wanted: str) -> bool:
     """
-    Case- and punctuation-insensitive partial match (same as index.ts).
-    "Robinson" matches "H. Robinson"; "R Baas" matches "R. Baas".
+    Exact captain match after normalizing punctuation and case.
+
+    Tokens must be equal (no substring / partial matches).
+    "R. Baas" ≡ "R Baas"; "Robinson" does NOT match "H. Robinson".
     """
     if not row_captain or not wanted:
         return False
@@ -459,7 +464,8 @@ def captain_matches(row_captain: str | None, wanted: str) -> bool:
     b = normalize_captain(wanted)
     if not a or not b:
         return False
-    return a == b or a in b or b in a
+    # Exact normalized-string equality ⇒ same token sequence.
+    return a == b
 
 
 def resolve_teams_from_standings(
@@ -501,18 +507,15 @@ def resolve_teams_from_standings(
         return matched, "captain", captain_match_details
 
     # Explicit teamName path (captainName empty / omitted).
+    # Exact case-insensitive match only — no substring / "partial" matches.
     wanted = config_team_name.lower()
     matched = [r for r in rows if r.team_name.lower() == wanted]
     if not matched:
-        # Fall back to case-insensitive substring if exact match fails.
-        partial = [r for r in rows if wanted in r.team_name.lower()]
-        if not partial:
-            names = ", ".join(r.team_name for r in rows) or "(none extracted)"
-            raise ResolveError(
-                f'No standings row matched teamName="{config_team_name}". '
-                f"Teams seen: {names}."
-            )
-        return partial, "teamName", []
+        names = ", ".join(r.team_name for r in rows) or "(none extracted)"
+        raise ResolveError(
+            f'No standings row matched teamName="{config_team_name}" (exact). '
+            f"Teams seen: {names}."
+        )
     return matched, "teamName", []
 
 
@@ -892,7 +895,7 @@ def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, An
         league_url=config.league_url or None,
     )
     seasons = list_seasons(api_base)
-    season = pick_current_season(seasons)
+    season = pick_current_season(seasons, season=config.season or None)
     season_uid = season["uid"]
     season_name = season.get("name") or ""
     log(f"Lean/API discovery: api={api_base} season={season_name!r} ({season_uid})")
@@ -983,6 +986,7 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
     season_name, divisions = discover_target_divisions(config)
 
     divisions_scanned: list[dict[str, Any]] = []
+    division_errors: list[dict[str, Any]] = []
     all_matched_teams: list[dict[str, Any]] = []
     captain_match_details: list[dict[str, Any]] = (
         [{"query": q, "matchedTeams": []} for q in captain_names] if use_captain else []
@@ -995,16 +999,26 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         if not uid and div.get("singleDivision") and config.league_url:
             m = re.search(r"/division/([0-9a-fA-F-]{36})", config.league_url)
             uid = m.group(1) if m else ""
+        division_name = div.get("divisionName") or ""
+        league_name = div.get("leagueName") or config.league or ""
+        day = div.get("dayOfWeek") or config.day or ""
         if not uid:
-            log(f"  skip division with no uid: {div.get('divisionName')}")
+            msg = f"skip division with no uid: {division_name or '(unnamed)'}"
+            log(f"  {msg}")
+            division_errors.append(
+                {
+                    "divisionUid": None,
+                    "divisionName": division_name,
+                    "leagueName": league_name,
+                    "stage": "discover",
+                    "error": msg,
+                }
+            )
             continue
 
         url = div.get("url") or lean_division_url(
             config.site_url or config.league_url or "https://flannagans.league.ninja", uid
         )
-        day = div.get("dayOfWeek") or config.day or ""
-        league_name = div.get("leagueName") or config.league or ""
-        division_name = div.get("divisionName") or ""
         meta = {
             "divisionUid": uid,
             "divisionName": division_name,
@@ -1018,6 +1032,7 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             rows_raw = get_standings(api_base, uid)
         except LeanApiError as err:
             log(f"  standings failed for {division_name or uid}: {err}")
+            division_errors.append({**meta, "stage": "standings", "error": str(err)})
             continue
 
         rows = [
@@ -1030,6 +1045,7 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             config_team_name=config_team_name,
         )
         if not matched:
+            # Soft miss in this division (expected for multi-div captain/team scans).
             continue
         if res:
             resolution = res
@@ -1060,6 +1076,8 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
             schedule = get_schedule_v2(api_base, uid)
         except LeanApiError as err:
             log(f"  schedule failed for {division_name or uid}: {err}")
+            division_errors.append({**meta, "stage": "schedule", "error": str(err)})
+            # Do not drop matched teams; record the error and continue other divisions.
             continue
         div_games = games_for_teams(schedule, team_names)
         for g in div_games:
@@ -1091,6 +1109,7 @@ def scrape_lean(config: AppConfig) -> dict[str, Any]:
         "levels": config.levels or None,
         "seasonName": season_name or None,
         "divisionsScanned": divisions_scanned,
+        "divisionErrors": division_errors or None,
         "captainSearched": (
             (captain_names[0] if len(captain_names) == 1 else captain_names)
             if use_captain
