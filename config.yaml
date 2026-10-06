@@ -1,0 +1,27 @@
+# stagehand-volleyball config (shared by the TypeScript scraper and python/).
+#
+# Template: config.example.yaml
+#
+# You must set at least one of captainName or teamName.
+# Keep string values in double quotes so characters like ":" or "#" are never misread.
+
+# Captain to search for on the standings page (preferred discovery path).
+# Case-insensitive; partial match OK ("Robinson" matches "H. Robinson").
+# Leave empty ("") or delete this line to use teamName instead.
+captainName: "H. Robinson"
+
+# Explicit team name. Used only when captainName is empty/absent.
+teamName: "Win or Lose We Booze"
+
+# Game-day label, stored in the output for convenience.
+day: "Sunday"
+
+# Human-readable league / division path for your own notes.
+league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
+
+# Division standings URL (the Standings tab). The schedule URL is built as
+# leagueUrl + schedulePathSuffix.
+leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
+
+# Optional: path appended to leagueUrl to reach the schedule tab (default "/schedule").
+schedulePathSuffix: "/schedule"

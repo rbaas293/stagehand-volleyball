@@ -7,7 +7,7 @@
  *       STAGEHAND_MODEL     optional, default "openai/gpt-5.6-luna"
  *       HEADLESS=false      optional: show the local Chrome window
  *
- * Target captain / team / day / league / URL come from config.json (see config.example.json).
+ * Target captain / team / day / league / URL come from config.yaml (see config.example.yaml).
  *
  * Resolution:
  *   - If captainName is set (non-empty), discover team(s) on the standings page whose
@@ -26,6 +26,7 @@ import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 import {
   browserbase,
   localBrowser,
@@ -36,7 +37,7 @@ import {
 import { z } from "zod/v4";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = join(ROOT, "config.json");
+const CONFIG_PATH = join(ROOT, "config.yaml");
 
 // ---- Config (captain / team / day / league / URL) --------------------------
 const ConfigSchema = z
@@ -70,16 +71,17 @@ function loadConfig(): AppConfig {
   } catch (err) {
     const why = err instanceof Error ? err.message : String(err);
     throw new ConfigError(
-      `Missing or unreadable config.json at ${CONFIG_PATH} (${why}). ` +
-        `Copy config.example.json to config.json and edit captainName and/or teamName, day, league, and leagueUrl.`,
+      `Missing or unreadable config.yaml at ${CONFIG_PATH} (${why}). ` +
+        `Copy config.example.yaml to config.yaml and edit captainName and/or teamName, day, league, and leagueUrl.`,
     );
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    // yaml's parse() uses the YAML 1.2 core schema: plain data only (no custom tags / code).
+    parsed = parseYaml(raw);
   } catch (err) {
     const why = err instanceof Error ? err.message : String(err);
-    throw new ConfigError(`config.json is not valid JSON: ${why}`);
+    throw new ConfigError(`config.yaml is not valid YAML: ${why}`);
   }
   const result = ConfigSchema.safeParse(parsed);
   if (!result.success) {
@@ -87,7 +89,7 @@ function loadConfig(): AppConfig {
       .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
       .join("; ");
     throw new ConfigError(
-      `config.json is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional schedulePathSuffix).`,
+      `config.yaml is invalid: ${details}. Expected day, league, leagueUrl, plus captainName and/or teamName (and optional schedulePathSuffix).`,
     );
   }
   return result.data;

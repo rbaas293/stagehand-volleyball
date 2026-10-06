@@ -5,6 +5,9 @@ stagehand==4.1.0
 # Pydantic is pulled in by stagehand; listed explicitly because our schemas use it.
 pydantic>=2.0,<3
 
+# PyYAML parses the shared ../config.yaml (main.py uses yaml.safe_load only).
+PyYAML>=6.0,<7
+
 # Optional: load ../.env and python/.env automatically. main.py also has a
 # tiny manual .env parser if this isn't installed.
 python-dotenv>=1.0,<2
