@@ -29,6 +29,7 @@ Multi-division: `levels: ["Beer A", "Beer B"]` plus `siteUrl`. Auto-pick prefers
 | `config.yaml` | Local only (gitignored) |
 | `python/main.py` | CLI entrypoint |
 | `python/lean_api.py` | Pub-api client (lean mode) |
+| `python/lean_http.py` | Robust lean HTTP (retries, circuit breaker, concurrency) |
 | `python/token_usage.py` | xAI token / cost accumulator |
 | `python/games.json` | Output (gitignored) |
 | `.env` (root or `python/`) | Secrets (gitignored); root `.env` is the fallback |
