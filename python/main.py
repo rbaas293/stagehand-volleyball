@@ -52,6 +52,22 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from stagehand import LLMStructuredGenerateResult, Stagehand, browserbase, local_browser
 
+# ---- Local helpers (lean HTTP API + LLM token accounting) -------------------
+from lean_api import (
+    LeanApiError,
+    division_url as lean_division_url,
+    filter_divisions_by_levels,
+    games_for_teams,
+    get_schedule_v2,
+    get_standings,
+    infer_api_base,
+    list_season_divisions,
+    list_seasons,
+    pick_current_season,
+    standing_row_from_api,
+)
+from token_usage import USAGE, reset_usage
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -92,6 +108,25 @@ class WeekTabError(Exception):
     """
 
 
+
+def utc_now_iso() -> str:
+    """UTC timestamp with millisecond precision, always ending in Z (no +00:00)."""
+    now = datetime.now(timezone.utc)
+    # Normalize to exactly 3 fractional digits so lean/llm runs compare cleanly.
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def omit_nulls(value: Any) -> Any:
+    """
+    Drop keys whose value is None (JSON null). Recurses into dicts/lists.
+    Keeps empty strings, empty lists, False, and 0.
+    """
+    if isinstance(value, dict):
+        return {k: omit_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [omit_nulls(v) for v in value]
+    return value
+
 def describe_error(err: BaseException) -> str:
     """
     Turn any exception into a non-empty, human-readable message.
@@ -118,19 +153,26 @@ class AppConfig(BaseModel):
     captain_name: list[str] = Field(default_factory=list, alias="captainName")
     # Explicit team name; used only when captainName is empty/absent.
     team_name: str = Field(default="", alias="teamName")
-    # Game-day label stored in the output for convenience (e.g. "Sunday").
-    day: str = Field(min_length=1)
-    # Human-readable league / division path for your own notes.
-    league: str = Field(min_length=1)
-    # Division standings URL; the script appends schedulePathSuffix for the schedule page.
-    # min_length=1 rejects "" outright; the validator below also rejects
-    # whitespace-only / non-URL values (zod's .url() does the same in index.ts).
-    league_url: str = Field(min_length=1, alias="leagueUrl")
+    # Game-day label (single-division notes). Optional when levels[] drives multi-div.
+    day: str = Field(default="")
+    # Human-readable league / division path for notes. Optional when levels[] is set.
+    league: str = Field(default="")
+    # Single-division standings URL (backward compatible). Optional when levels[] is set.
+    league_url: str = Field(default="", alias="leagueUrl")
     # Path appended to leagueUrl to reach the schedule tab (default "/schedule").
     schedule_path_suffix: str = Field(default="/schedule", alias="schedulePathSuffix")
     # xAI Grok model id (api.x.ai). Stagehand v4 has no native xAI provider;
     # we call Grok through a BYO LLM callback (OpenAI-compatible client).
     model: str = Field(default="grok-4-fast-reasoning", min_length=1)
+    # Scraping mode: "lean" = pub-api HTTP (no LLM); "llm" = Stagehand extract per page.
+    mode: Literal["lean", "llm"] = "lean"
+    # When non-empty, discover + scrape every division whose league/division name
+    # contains any of these substrings (e.g. "Beer A", "Beer B") across the current season.
+    levels: list[str] = Field(default_factory=list)
+    # Club site origin for building division URLs (multi-div). E.g. https://flannagans.league.ninja
+    site_url: str = Field(default="", alias="siteUrl")
+    # Optional override for the LMS pub API base. Inferred for known clubs from siteUrl/leagueUrl.
+    api_base_url: str = Field(default="", alias="apiBaseUrl")
 
     # Allow reading camelCase YAML keys while exposing snake_case attributes in Python.
     model_config = {"populate_by_name": True}
@@ -153,13 +195,36 @@ class AppConfig(BaseModel):
             return out
         raise ValueError("captainName must be a string or a list of strings")
 
+    @field_validator("levels", mode="before")
+    @classmethod
+    def coerce_levels(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return [trimmed] if trimmed else []
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()]
+        raise ValueError("levels must be a string or a list of strings")
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def coerce_mode(cls, value: Any) -> str:
+        if value is None or value == "":
+            return "lean"
+        s = str(value).strip().lower()
+        if s not in ("lean", "llm"):
+            raise ValueError('mode must be "lean" or "llm"')
+        return s
+
     @field_validator("league_url")
     @classmethod
-    def require_http_url(cls, value: str) -> str:
-        """Reject empty / whitespace-only / non-http(s) leagueUrl values."""
-        stripped = value.strip()
+    def optional_http_url(cls, value: str) -> str:
+        """Allow empty leagueUrl (multi-div via levels); validate when present."""
+        stripped = (value or "").strip()
+        if not stripped:
+            return ""
         parsed = urlparse(stripped)
-        # Need both a scheme (http/https) and a host, e.g. https://x.league.ninja/...
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(
                 "leagueUrl must be a non-empty http(s) URL, e.g. "
@@ -168,14 +233,26 @@ class AppConfig(BaseModel):
         return stripped
 
     @model_validator(mode="after")
-    def require_captain_or_team(self) -> "AppConfig":
-        """Same rule as the TS superRefine: at least one of captain/team must be set."""
+    def require_captain_or_team_and_target(self) -> "AppConfig":
+        """Captain/team required; need leagueUrl and/or levels[] for what to scrape."""
         has_captain = len(self.captain_name) > 0
         has_team = bool(self.team_name.strip())
         if not has_captain and not has_team:
             raise ValueError(
                 "Set captainName (string or list, to discover team(s) by captain) "
                 "and/or teamName (explicit team when captainName is empty)."
+            )
+        has_levels = len(self.levels) > 0
+        has_url = bool(self.league_url.strip())
+        if not has_levels and not has_url:
+            raise ValueError(
+                "Set leagueUrl (single division) and/or levels (e.g. [Beer A, Beer B] "
+                "to discover matching divisions for the current season)."
+            )
+        if has_levels and not has_url and not self.site_url.strip() and not self.api_base_url.strip():
+            raise ValueError(
+                "When using levels without leagueUrl, set siteUrl and/or apiBaseUrl "
+                "so the scraper can reach the club pub API."
             )
         return self
 
@@ -439,6 +516,32 @@ def resolve_teams_from_standings(
     return matched, "teamName", []
 
 
+
+def try_resolve_teams_from_standings(
+    rows: list[StandingsRow],
+    *,
+    use_captain: bool,
+    captain_names: list[str],
+    config_team_name: str,
+) -> tuple[list[StandingsRow], Literal["captain", "teamName"] | None, list[dict[str, Any]]]:
+    """
+    Like resolve_teams_from_standings, but returns ([], None, details) when nothing matches
+    instead of raising — used when scanning many divisions.
+    """
+    try:
+        return resolve_teams_from_standings(
+            rows,
+            use_captain=use_captain,
+            captain_names=captain_names,
+            config_team_name=config_team_name,
+        )
+    except ResolveError:
+        # Still return per-query empty details for captain mode.
+        if use_captain:
+            details = [{"query": q, "matchedTeams": []} for q in captain_names]
+            return [], None, details
+        return [], None, []
+
 # ---------------------------------------------------------------------------
 # Logging / browser setup
 # ---------------------------------------------------------------------------
@@ -515,6 +618,8 @@ def make_grok_generate(api_key: str, model_id: str):
                 }
             },
         )
+        # Record real prompt/completion/total tokens from the API usage field.
+        USAGE.record(getattr(response, "usage", None), model=model_id)
         return LLMStructuredGenerateResult.model_validate(
             {
                 "role": "assistant",
@@ -750,226 +855,634 @@ async def page_mentions_any_team(page, team_names: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main scrape flow
+# Division discovery (shared by lean + llm multi-div)
 # ---------------------------------------------------------------------------
-async def scrape() -> dict[str, Any]:
+def discover_target_divisions(config: AppConfig) -> tuple[str, list[dict[str, Any]]]:
     """
-    End-to-end scrape. Returns the output dict that we also write to games.json.
-    """
-    # Load .env before reading keys / HEADLESS so local runs Just Work.
-    load_dotenv_files()
-    config = load_config()
+    Return (season_name, divisions[]) to scrape.
 
-    # Normalize the discovery knobs once (captain_name is already a list[str]).
+    - If config.levels is non-empty: current season nav filtered by level substrings.
+    - Else: single synthetic division from config.leagueUrl.
+    """
+    levels = list(config.levels)
+    if not levels:
+        # Single-division backward-compatible mode.
+        league_url = config.league_url.rstrip("/")
+        # Extract div uid from .../division/<uuid>
+        m = re.search(r"/division/([0-9a-fA-F-]{36})", league_url)
+        div_uid = m.group(1) if m else ""
+        return (
+            config.league or "",
+            [
+                {
+                    "divisionUid": div_uid,
+                    "divisionName": config.league or league_url,
+                    "leagueName": config.league or "",
+                    "dayOfWeek": config.day or "",
+                    "seasonName": "",
+                    "url": league_url,
+                    "singleDivision": True,
+                }
+            ],
+        )
+
+    api_base = infer_api_base(
+        api_base_url=config.api_base_url or None,
+        site_url=config.site_url or None,
+        league_url=config.league_url or None,
+    )
+    seasons = list_seasons(api_base)
+    season = pick_current_season(seasons)
+    season_uid = season["uid"]
+    season_name = season.get("name") or ""
+    log(f"Lean/API discovery: api={api_base} season={season_name!r} ({season_uid})")
+    all_divs = list_season_divisions(api_base, season_uid)
+    matched = filter_divisions_by_levels(all_divs, levels)
+    site = (config.site_url or config.league_url or "https://flannagans.league.ninja").strip()
+    out: list[dict[str, Any]] = []
+    for d in matched:
+        uid = d.get("divisionUid") or ""
+        out.append(
+            {
+                **d,
+                "url": lean_division_url(site, uid) if uid else "",
+                "singleDivision": False,
+            }
+        )
+    log(f"levels={levels!r}: {len(out)}/{len(all_divs)} divisions matched")
+    return season_name, out
+
+
+def _merge_captain_details(
+    acc: list[dict[str, Any]], detail: dict[str, Any], *, div_meta: dict[str, Any]
+) -> None:
+    """Append matched teams (with division meta) into the accumulator keyed by query."""
+    query = detail["query"]
+    slot = next((x for x in acc if x["query"] == query), None)
+    if slot is None:
+        slot = {"query": query, "matchedTeams": []}
+        acc.append(slot)
+    for t in detail["matchedTeams"]:
+        # t may be StandingsRow or dict
+        if isinstance(t, StandingsRow):
+            entry = {
+                "teamName": t.team_name,
+                "captainName": t.captain_name,
+                "record": t.record,
+                "standing": t.standing,
+            }
+        else:
+            entry = {
+                "teamName": t.get("teamName"),
+                "captainName": t.get("captainName"),
+                "record": t.get("record"),
+                "standing": t.get("standing"),
+            }
+        entry.update(
+            {
+                "divisionName": div_meta.get("divisionName"),
+                "leagueName": div_meta.get("leagueName"),
+                "day": div_meta.get("dayOfWeek") or div_meta.get("day"),
+                "url": div_meta.get("url"),
+                "divisionUid": div_meta.get("divisionUid"),
+            }
+        )
+        # Dedup by team+division
+        key = (entry["teamName"] or "").lower(), entry.get("divisionUid")
+        exists = any(
+            ((m.get("teamName") or "").lower(), m.get("divisionUid")) == key
+            for m in slot["matchedTeams"]
+        )
+        if not exists:
+            slot["matchedTeams"].append(entry)
+
+
+# ---------------------------------------------------------------------------
+# Lean scrape (HTTP pub-api, no LLM)
+# ---------------------------------------------------------------------------
+def scrape_lean(config: AppConfig) -> dict[str, Any]:
+    """Full lean path: discover divisions, standings + schedule via pub API."""
+    import time
+
+    t0 = time.perf_counter()
+    reset_usage(model="")  # lean makes no LLM calls
     captain_names = list(config.captain_name)
     config_team_name = config.team_name.strip()
     use_captain = len(captain_names) > 0
 
-    # Strip trailing slashes so suffix join is predictable.
-    league_url = config.league_url.rstrip("/")
-    suffix = config.schedule_path_suffix
-    if not suffix.startswith("/"):
-        suffix = f"/{suffix}"
-    schedule_url = f"{league_url}{suffix}"
+    if use_captain:
+        log(f'Config: mode=lean captains={json.dumps(captain_names)} levels={config.levels!r}')
+    else:
+        log(f'Config: mode=lean team="{config_team_name}" levels={config.levels!r}')
 
-    # Announce what we're about to scrape (mirrors TS logs).
+    api_base = infer_api_base(
+        api_base_url=config.api_base_url or None,
+        site_url=config.site_url or None,
+        league_url=config.league_url or None,
+    )
+    season_name, divisions = discover_target_divisions(config)
+
+    divisions_scanned: list[dict[str, Any]] = []
+    all_matched_teams: list[dict[str, Any]] = []
+    captain_match_details: list[dict[str, Any]] = (
+        [{"query": q, "matchedTeams": []} for q in captain_names] if use_captain else []
+    )
+    games: list[dict[str, Any]] = []
+    resolution: str | None = None
+
+    for div in divisions:
+        uid = div.get("divisionUid") or ""
+        if not uid and div.get("singleDivision") and config.league_url:
+            m = re.search(r"/division/([0-9a-fA-F-]{36})", config.league_url)
+            uid = m.group(1) if m else ""
+        if not uid:
+            log(f"  skip division with no uid: {div.get('divisionName')}")
+            continue
+
+        url = div.get("url") or lean_division_url(
+            config.site_url or config.league_url or "https://flannagans.league.ninja", uid
+        )
+        day = div.get("dayOfWeek") or config.day or ""
+        league_name = div.get("leagueName") or config.league or ""
+        division_name = div.get("divisionName") or ""
+        meta = {
+            "divisionUid": uid,
+            "divisionName": division_name,
+            "leagueName": league_name,
+            "dayOfWeek": day,
+            "url": url,
+        }
+        divisions_scanned.append({**meta, "seasonName": div.get("seasonName") or season_name})
+
+        try:
+            rows_raw = get_standings(api_base, uid)
+        except LeanApiError as err:
+            log(f"  standings failed for {division_name or uid}: {err}")
+            continue
+
+        rows = [
+            StandingsRow.model_validate(standing_row_from_api(r)) for r in rows_raw
+        ]
+        matched, res, details = try_resolve_teams_from_standings(
+            rows,
+            use_captain=use_captain,
+            captain_names=captain_names,
+            config_team_name=config_team_name,
+        )
+        if not matched:
+            continue
+        if res:
+            resolution = res
+        for d in details:
+            _merge_captain_details(captain_match_details, d, div_meta=meta)
+
+        team_names = [t.team_name for t in matched]
+        for t in matched:
+            all_matched_teams.append(
+                {
+                    "teamName": t.team_name,
+                    "captainName": t.captain_name,
+                    "record": t.record,
+                    "standing": t.standing,
+                    "divisionName": division_name,
+                    "leagueName": league_name,
+                    "day": day,
+                    "url": url,
+                    "divisionUid": uid,
+                }
+            )
+        log(
+            f"  matched in {division_name}: "
+            + ", ".join(f'"{t.team_name}" (captain={t.captain_name or "?"})' for t in matched)
+        )
+
+        try:
+            schedule = get_schedule_v2(api_base, uid)
+        except LeanApiError as err:
+            log(f"  schedule failed for {division_name or uid}: {err}")
+            continue
+        div_games = games_for_teams(schedule, team_names)
+        for g in div_games:
+            g = {
+                **g,
+                "divisionName": division_name,
+                "leagueName": league_name,
+                "day": day,
+                "url": url,
+            }
+            games.append(g)
+        log(f"    -> {len(div_games)} game(s)")
+
+    if use_captain and not all_matched_teams:
+        raise ResolveError(
+            f"No standings row matched captainName={json.dumps(captain_names)} "
+            f"across {len(divisions_scanned)} division(s)."
+        )
+    if not use_captain and not all_matched_teams:
+        raise ResolveError(
+            f'No standings row matched teamName="{config_team_name}" '
+            f"across {len(divisions_scanned)} division(s)."
+        )
+
+    elapsed = time.perf_counter() - t0
+    team_names_flat = [t["teamName"] for t in all_matched_teams]
+    output: dict[str, Any] = {
+        "mode": "lean",
+        "levels": config.levels or None,
+        "seasonName": season_name or None,
+        "divisionsScanned": divisions_scanned,
+        "captainSearched": (
+            (captain_names[0] if len(captain_names) == 1 else captain_names)
+            if use_captain
+            else None
+        ),
+        "captainMatchDetails": captain_match_details if use_captain else None,
+        "resolution": resolution or ("captain" if use_captain else "teamName"),
+        "matchedTeams": all_matched_teams,
+        "team": team_names_flat[0] if len(team_names_flat) == 1 else team_names_flat,
+        "day": config.day or None,
+        "league": config.league or None,
+        "url": config.league_url or None,
+        "scrapedAt": utc_now_iso(),
+        "games": games,
+        "tokenUsage": USAGE.as_dict(),
+        "runtimeSeconds": round(elapsed, 3),
+    }
+    if len(all_matched_teams) == 1:
+        output["teamRecord"] = all_matched_teams[0].get("record")
+        output["teamStanding"] = all_matched_teams[0].get("standing")
+        output["leagueName"] = all_matched_teams[0].get("leagueName")
+        output["divisionName"] = all_matched_teams[0].get("divisionName")
+    USAGE.print_summary(log)
+    log(f"Lean scrape finished in {elapsed:.2f}s")
+    return output
+
+
+# ---------------------------------------------------------------------------
+# LLM scrape (Stagehand extract) — single or multi division
+# ---------------------------------------------------------------------------
+async def scrape_llm_division(
+    stagehand: Stagehand,
+    page,
+    *,
+    league_url: str,
+    schedule_url: str,
+    use_captain: bool,
+    captain_names: list[str],
+    config_team_name: str,
+    day: str,
+    league: str,
+    div_meta: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """
+    Scrape one division with Stagehand. Returns a partial result dict, or None if
+    no teams matched (multi-div soft miss). Raises ResolveError in single-div mode
+    when div_meta is None / singleDivision.
+    """
+    single = not div_meta or div_meta.get("singleDivision")
+    log(f"Opening standings: {league_url}")
+    await page.goto(league_url, wait_until="networkidle", timeout=60_000)
+    await page.wait_for_timeout(1_500)
+
+    standings_result = await stagehand.extract(
+        (
+            "From this league standings page, get the league/season name, "
+            "the division name, and every row in the standings table. "
+            "For each row extract the full team name, the captain name "
+            "(often shown next to or under the team), the W-L record, "
+            "and the rank. Include every team, not just one."
+        ),
+        Standings,
+    )
+    standings = standings_result.data
+
+    if single:
+        matched_teams, resolution, captain_match_details = resolve_teams_from_standings(
+            standings.rows or [],
+            use_captain=use_captain,
+            captain_names=captain_names,
+            config_team_name=config_team_name,
+        )
+    else:
+        matched_teams, resolution, captain_match_details = try_resolve_teams_from_standings(
+            standings.rows or [],
+            use_captain=use_captain,
+            captain_names=captain_names,
+            config_team_name=config_team_name,
+        )
+        if not matched_teams:
+            return None
+
+    team_names = [t.team_name for t in matched_teams]
+    log(
+        "Resolved via "
+        + (resolution or "?")
+        + ": "
+        + ", ".join(
+            f'"{t.team_name}" (captain={t.captain_name or "?"})' for t in matched_teams
+        )
+    )
+
+    log(f"Opening schedule: {schedule_url}")
+    await page.goto(schedule_url, wait_until="networkidle", timeout=60_000)
+    await page.wait_for_timeout(1_500)
+
+    week_labels = await list_week_tab_labels(page)
+    log(f"Found {len(week_labels)} week tabs: {' | '.join(week_labels)}")
+
+    games: list[Game] = []
+    rounds_without_team_games: list[str] = []
+    extract_schema = games_schema_for(team_names)
+    team_list_for_prompt = " or ".join(f'"{t}"' for t in team_names)
+    team_names_csv = ", ".join(team_names)
+
+    for label in week_labels:
+        await click_week_tab(stagehand, page, label)
+        await page.wait_for_timeout(750)
+
+        if not await page_mentions_any_team(page, team_names):
+            log(f"  {label}: no matched-team games listed")
+            rounds_without_team_games.append(label)
+            continue
+
+        extract_result = await stagehand.extract(
+            (
+                f'This page shows the games for the selected week tab "{label}". '
+                f"List every match on the selected week where {team_list_for_prompt} "
+                "is one of the two teams. Each match card shows date+time, "
+                "location/court, the two team names (each followed by a captain name), "
+                'and sometimes "Winner - <team>". For each match set "team" to whichever '
+                f"of [{team_names_csv}] is playing, and \"opponent\" to the other side. "
+                f'Ignore captain names on the schedule cards. Set week to "{label}".'
+            ),
+            extract_schema,
+        )
+
+        week_games: list[Game] = list(extract_result.data.games)
+        log(f"  {label}: {len(week_games)} game(s)")
+        for g in week_games:
+            if not g.week:
+                g.week = label
+            if not g.team and len(team_names) == 1:
+                g.team = team_names[0]
+            games.append(g)
+
+    meta = div_meta or {}
+    day_out = meta.get("dayOfWeek") or day
+    league_name_out = meta.get("leagueName") or standings.league_name or league
+    division_name_out = meta.get("divisionName") or standings.division_name
+
+    return {
+        "matchedTeams": matched_teams,
+        "resolution": resolution,
+        "captainMatchDetails": captain_match_details,
+        "games": games,
+        "roundsWithoutTeamGames": rounds_without_team_games,
+        "leagueName": standings.league_name,
+        "divisionName": standings.division_name,
+        "day": day_out,
+        "leagueNameResolved": league_name_out,
+        "divisionNameResolved": division_name_out,
+        "url": league_url,
+        "meta": meta,
+    }
+
+
+async def scrape_llm(config: AppConfig) -> dict[str, Any]:
+    """Stagehand LLM extract path (single or multi-division)."""
+    import time
+
+    t0 = time.perf_counter()
+    model_id = resolve_grok_model_id(config.model)
+    reset_usage(model=model_id)
+
+    captain_names = list(config.captain_name)
+    config_team_name = config.team_name.strip()
+    use_captain = len(captain_names) > 0
+
     if use_captain:
         ignored = (
             f' (config teamName="{config_team_name}" ignored while captainName is set)'
             if config_team_name
             else ""
         )
-        log(f'Config: captains={json.dumps(captain_names)}{ignored} day="{config.day}" league="{config.league}"')
+        log(
+            f'Config: mode=llm captains={json.dumps(captain_names)}{ignored} '
+            f'levels={config.levels!r} model={model_id!r}'
+        )
     else:
-        log(f'Config: team="{config_team_name}" day="{config.day}" league="{config.league}"')
-    log(f"Standings URL: {league_url}")
-    log(f"Schedule URL:  {schedule_url}")
-    log(f"Config path:   {CONFIG_PATH}")
+        log(f'Config: mode=llm team="{config_team_name}" levels={config.levels!r} model={model_id!r}')
 
-    # Fail fast on missing API key *before* launching Chrome.
     create_kwargs = model_kwargs(config.model)
+    season_name, divisions = discover_target_divisions(config)
+
+    suffix = config.schedule_path_suffix
+    if not suffix.startswith("/"):
+        suffix = f"/{suffix}"
 
     browser = await launch_browser()
     try:
-        # Create the Stagehand client bound to this browser + model.
         stagehand = await Stagehand.create(browser=browser, **create_kwargs)
         try:
-            # Use the first (default) page in the browser context.
             pages = await browser.context.pages()
             page = pages[0]
 
-            # ---------------------------------------------------------------
-            # 1) Standings: extract every row, then resolve target team(s).
-            # ---------------------------------------------------------------
-            log(f"Opening standings: {league_url}")
-            await page.goto(league_url, wait_until="networkidle", timeout=60_000)
-            # Brief settle so client-rendered standings finish painting.
-            await page.wait_for_timeout(1_500)
-
-            standings_result = await stagehand.extract(
-                (
-                    "From this league standings page, get the league/season name, "
-                    "the division name, and every row in the standings table. "
-                    "For each row extract the full team name, the captain name "
-                    "(often shown next to or under the team), the W-L record, "
-                    "and the rank. Include every team, not just one."
-                ),
-                Standings,
+            all_matched: list[dict[str, Any]] = []
+            captain_match_details: list[dict[str, Any]] = (
+                [{"query": q, "matchedTeams": []} for q in captain_names] if use_captain else []
             )
-            standings = standings_result.data
+            all_games: list[dict[str, Any]] = []
+            rounds_without: list[str] = []
+            divisions_scanned: list[dict[str, Any]] = []
+            resolution: str | None = None
+            last_standings_meta: dict[str, Any] = {}
 
-            matched_teams, resolution, captain_match_details = resolve_teams_from_standings(
-                standings.rows or [],
-                use_captain=use_captain,
-                captain_names=captain_names,
-                config_team_name=config_team_name,
+            # Multi-div LLM: HTTP-prefilter standings so we only launch Stagehand
+            # extracts on divisions that actually match a captain/team (avoids
+            # dozens of useless LLM standings calls). Disable with SCRAPE_LLM_PREFILTER=0.
+            prefilter = os.environ.get("SCRAPE_LLM_PREFILTER", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
             )
-            team_names = [t.team_name for t in matched_teams]
-            log(
-                "Resolved via "
-                + resolution
-                + ": "
-                + ", ".join(
-                    f'"{t.team_name}" (captain={t.captain_name or "?"})'
-                    for t in matched_teams
+            if prefilter and config.levels and not any(d.get("singleDivision") for d in divisions):
+                api_base = infer_api_base(
+                    api_base_url=config.api_base_url or None,
+                    site_url=config.site_url or None,
+                    league_url=config.league_url or None,
                 )
-            )
-            for detail in captain_match_details:
-                hits = detail["matchedTeams"]
-                q = json.dumps(detail["query"])
-                if not hits:
-                    log(f"  captain query {q}: no team matched")
-                else:
-                    log(
-                        f"  captain query {q}: "
-                        + ", ".join(
-                            f'"{t.team_name}" (captain={t.captain_name or "?"})'
-                            for t in hits
-                        )
+                kept: list[dict[str, Any]] = []
+                for div in divisions:
+                    uid = div.get("divisionUid") or ""
+                    if not uid:
+                        continue
+                    try:
+                        rows_raw = get_standings(api_base, uid)
+                    except LeanApiError as err:
+                        log(f"  prefilter standings failed {uid}: {err}")
+                        continue
+                    rows = [
+                        StandingsRow.model_validate(standing_row_from_api(r)) for r in rows_raw
+                    ]
+                    matched, _, _ = try_resolve_teams_from_standings(
+                        rows,
+                        use_captain=use_captain,
+                        captain_names=captain_names,
+                        config_team_name=config_team_name,
                     )
+                    if matched:
+                        kept.append(div)
+                log(
+                    f"LLM prefilter: {len(kept)}/{len(divisions)} divisions have "
+                    f"captain/team matches (HTTP standings); Stagehand will scrape those only"
+                )
+                divisions = kept
 
-            # ---------------------------------------------------------------
-            # 2) Schedule: select + verify each week tab, extract() games.
-            # ---------------------------------------------------------------
-            log(f"Opening schedule: {schedule_url}")
-            await page.goto(schedule_url, wait_until="networkidle", timeout=60_000)
-            await page.wait_for_timeout(1_500)
+            for div in divisions:
+                uid = div.get("divisionUid") or ""
+                league_url = (div.get("url") or config.league_url or "").rstrip("/")
+                if not league_url and uid:
+                    league_url = lean_division_url(
+                        config.site_url or "https://flannagans.league.ninja", uid
+                    )
+                if not league_url:
+                    continue
+                schedule_url = f"{league_url}{suffix}"
+                meta = {
+                    "divisionUid": uid,
+                    "divisionName": div.get("divisionName"),
+                    "leagueName": div.get("leagueName"),
+                    "dayOfWeek": div.get("dayOfWeek") or config.day,
+                    "url": league_url,
+                    "singleDivision": bool(div.get("singleDivision")),
+                    "seasonName": div.get("seasonName") or season_name,
+                }
+                divisions_scanned.append(meta)
 
-            week_labels = await list_week_tab_labels(page)
-            log(f"Found {len(week_labels)} week tabs: {' | '.join(week_labels)}")
-
-            games: list[Game] = []
-            rounds_without_team_games: list[str] = []
-            extract_schema = games_schema_for(team_names)
-            team_list_for_prompt = " or ".join(f'"{t}"' for t in team_names)
-            team_names_csv = ", ".join(team_names)
-
-            for label in week_labels:
-                # Exact-text click (act() fallback), then verify the selected
-                # tab really is `label`; raises WeekTabError if it never is.
-                await click_week_tab(stagehand, page, label)
-                # Short settle so the week's match cards finish rendering
-                # after aria-selected flips.
-                await page.wait_for_timeout(750)
-
-                # Skip LLM when none of our teams appear in this week's DOM.
-                if not await page_mentions_any_team(page, team_names):
-                    log(f"  {label}: no matched-team games listed")
-                    rounds_without_team_games.append(label)
+                partial = await scrape_llm_division(
+                    stagehand,
+                    page,
+                    league_url=league_url,
+                    schedule_url=schedule_url,
+                    use_captain=use_captain,
+                    captain_names=captain_names,
+                    config_team_name=config_team_name,
+                    day=config.day,
+                    league=config.league,
+                    div_meta=meta,
+                )
+                if partial is None:
                     continue
 
-                extract_result = await stagehand.extract(
-                    (
-                        f'This page shows the games for the selected week tab "{label}". '
-                        f"List every match on the selected week where {team_list_for_prompt} "
-                        "is one of the two teams. Each match card shows date+time, "
-                        "location/court, the two team names (each followed by a captain name), "
-                        'and sometimes "Winner - <team>". For each match set "team" to whichever '
-                        f"of [{team_names_csv}] is playing, and \"opponent\" to the other side. "
-                        f'Ignore captain names on the schedule cards. Set week to "{label}".'
-                    ),
-                    extract_schema,
+                resolution = partial["resolution"] or resolution
+                last_standings_meta = partial
+                for d in partial["captainMatchDetails"]:
+                    _merge_captain_details(captain_match_details, d, div_meta=meta)
+                for t in partial["matchedTeams"]:
+                    all_matched.append(
+                        {
+                            "teamName": t.team_name,
+                            "captainName": t.captain_name,
+                            "record": t.record,
+                            "standing": t.standing,
+                            "divisionName": meta.get("divisionName") or partial.get("divisionName"),
+                            "leagueName": meta.get("leagueName") or partial.get("leagueName"),
+                            "day": meta.get("dayOfWeek") or config.day,
+                            "url": league_url,
+                            "divisionUid": uid,
+                        }
+                    )
+                for g in partial["games"]:
+                    gd = g.model_dump(by_alias=False)
+                    gd.update(
+                        {
+                            "divisionName": meta.get("divisionName") or partial.get("divisionName"),
+                            "leagueName": meta.get("leagueName") or partial.get("leagueName"),
+                            "day": meta.get("dayOfWeek") or config.day,
+                            "url": league_url,
+                        }
+                    )
+                    all_games.append(gd)
+                rounds_without.extend(partial.get("roundsWithoutTeamGames") or [])
+
+            if use_captain and not all_matched:
+                raise ResolveError(
+                    f"No standings row matched captainName={json.dumps(captain_names)} "
+                    f"across {len(divisions_scanned)} division(s)."
+                )
+            if not use_captain and not all_matched:
+                raise ResolveError(
+                    f'No standings row matched teamName="{config_team_name}" '
+                    f"across {len(divisions_scanned)} division(s)."
                 )
 
-                week_games: list[Game] = list(extract_result.data.games)
-                log(f"  {label}: {len(week_games)} game(s)")
-
-                # Fill week / team defaults the same way the TS scraper does.
-                for g in week_games:
-                    if not g.week:
-                        g.week = label
-                    if not g.team and len(team_names) == 1:
-                        g.team = team_names[0]
-                    games.append(g)
-
-            # ---------------------------------------------------------------
-            # 3) Build output payload (shape matches the TypeScript scraper).
-            # ---------------------------------------------------------------
+            elapsed = time.perf_counter() - t0
+            team_names_flat = [t["teamName"] for t in all_matched]
             output: dict[str, Any] = {
+                "mode": "llm",
+                "levels": config.levels or None,
+                "seasonName": season_name or None,
+                "divisionsScanned": divisions_scanned,
                 "captainSearched": (
                     (captain_names[0] if len(captain_names) == 1 else captain_names)
                     if use_captain
                     else None
                 ),
-                "captainMatchDetails": (
-                    [
-                        {
-                            "query": d["query"],
-                            "matchedTeams": [
-                                {
-                                    "teamName": t.team_name,
-                                    "captainName": t.captain_name,
-                                    "record": t.record,
-                                    "standing": t.standing,
-                                }
-                                for t in d["matchedTeams"]
-                            ],
-                        }
-                        for d in captain_match_details
-                    ]
-                    if use_captain
-                    else None
-                ),
-                "resolution": resolution,
-                "matchedTeams": [
-                    {
-                        "teamName": t.team_name,
-                        "captainName": t.captain_name,
-                        "record": t.record,
-                        "standing": t.standing,
-                    }
-                    for t in matched_teams
-                ],
-                # Back-compat: single string when one team matched, else list.
-                "team": team_names[0] if len(team_names) == 1 else team_names,
-                "day": config.day,
-                "league": config.league,
-                "url": league_url,
-                "scrapedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "leagueName": standings.league_name,
-                "divisionName": standings.division_name,
-                "games": [g.model_dump(by_alias=False) for g in games],
-                "roundsWithoutTeamGames": rounds_without_team_games,
+                "captainMatchDetails": captain_match_details if use_captain else None,
+                "resolution": resolution or ("captain" if use_captain else "teamName"),
+                "matchedTeams": all_matched,
+                "team": team_names_flat[0] if len(team_names_flat) == 1 else team_names_flat,
+                "day": config.day or None,
+                "league": config.league or None,
+                "url": config.league_url or None,
+                "scrapedAt": utc_now_iso(),
+                "leagueName": last_standings_meta.get("leagueName"),
+                "divisionName": last_standings_meta.get("divisionName"),
+                "games": all_games,
+                "roundsWithoutTeamGames": rounds_without,
+                "tokenUsage": USAGE.as_dict(),
+                "runtimeSeconds": round(elapsed, 3),
             }
-            # Only emit single-team record/standing when exactly one team matched.
-            if len(matched_teams) == 1:
-                output["teamRecord"] = matched_teams[0].record
-                output["teamStanding"] = matched_teams[0].standing
-
+            if len(all_matched) == 1:
+                output["teamRecord"] = all_matched[0].get("record")
+                output["teamStanding"] = all_matched[0].get("standing")
+            USAGE.print_summary(log)
+            log(f"LLM scrape finished in {elapsed:.2f}s")
             return output
         finally:
-            # Always tear down the Stagehand session (LLM / CDP bridge).
             await stagehand.close()
     finally:
-        # Always close the browser so Chrome/Browserbase sessions don't leak.
         await browser.close()
+
+
+async def scrape() -> dict[str, Any]:
+    """
+    End-to-end scrape. Returns the output dict that we also write to games.json.
+
+    mode=lean → HTTP pub-api (no browser / no LLM)
+    mode=llm  → Stagehand extract (browser + Grok BYO callback)
+    Override mode with env SCRAPE_MODE=lean|llm.
+    """
+    load_dotenv_files()
+    config = load_config()
+    mode = (os.environ.get("SCRAPE_MODE") or config.mode or "lean").strip().lower()
+    if mode not in ("lean", "llm"):
+        raise ConfigError(f'Invalid mode {mode!r}; use "lean" or "llm"')
+    # Mutate a copy so env override wins without rewriting the file.
+    if mode != config.mode:
+        log(f"SCRAPE_MODE override: {config.mode} → {mode}")
+        config = config.model_copy(update={"mode": mode})
+
+    log(f"Config path:   {CONFIG_PATH}")
+    if config.mode == "lean":
+        return scrape_lean(config)
+    return await scrape_llm(config)
 
 
 async def async_main() -> None:
     """Run scrape(), print JSON to stdout, write python/games.json."""
-    output = await scrape()
+    output = omit_nulls(await scrape())
     json_text = json.dumps(output, indent=2)
-    # stdout: machine-readable result (can pipe to jq, etc.)
     print(json_text)
     OUTPUT_PATH.write_text(json_text + "\n", encoding="utf-8")
     n_games = len(output.get("games") or [])
@@ -977,11 +1490,12 @@ async def async_main() -> None:
     log(f"Wrote {n_games} games for {n_teams} team(s) to {OUTPUT_PATH}")
 
 
+
 def main() -> None:
     """CLI entrypoint: translate known errors into clean stderr + exit 1."""
     try:
         asyncio.run(async_main())
-    except (ConfigError, MissingKeyError, ResolveError, WeekTabError) as err:
+    except (ConfigError, MissingKeyError, ResolveError, WeekTabError, LeanApiError) as err:
         # Friendly one-liners for config / key / resolve / week-tab failures.
         # describe_error() never returns an empty string.
         print(describe_error(err), file=sys.stderr)

@@ -1,150 +1,74 @@
 # stagehand-volleyball
 
-Scrapes a volleyball team's schedule from a [league.ninja](https://league.ninja) division page with
-[Stagehand v4](https://docs.stagehand.dev/v4/first-steps/quickstart) (`@browserbasehq/stagehand`).
+Scrapes volleyball team schedules from [league.ninja](https://league.ninja) (Flannagan's and similar clubs).
 
-Default target (editable in `config.yaml`): captain **H. Robinson** → **Win or Lose We Booze**, Sunday Beer A at Flannagan's, Summer III 2026.
+Default config searches captains **H. Robinson** / **R. Baas** / **Ryan Baas** across **Beer A** and **Beer B** divisions for the current season.
 
-What it does:
+## Modes
 
-1. Loads `config.yaml` (optional captain name and/or team name, day, league label, division URL).
-2. Launches Chrome (`localBrowser.launch()`), or a Browserbase cloud browser if `BROWSERBASE_API_KEY` is set.
-3. Opens the division **Standings** page and uses `stagehand.extract()` (zod schema) to get the league name, division name, and every standings row (team + captain + W-L + rank).
-4. **Resolves which team(s) to scrape** (see [Team resolution](#team-resolution) below).
-5. Opens the **Schedule** page, clicks through every week tab (Week 1 … Week 6, tournaments), and extracts each game for the matched team(s):
-   `date`, `time`, `week`, `team`, `opponent`, `location`, `status` (`scheduled` / `completed` / `cancelled`), and `result` when one is shown.
-6. Prints the JSON to stdout and writes it to `games.json` in this folder. Rounds where none of the matched teams are listed yet (e.g. a tournament bracket that hasn't been posted) go in `roundsWithoutTeamGames`.
-7. Closes Stagehand and the browser.
+| `mode` | What it does |
+|---|---|
+| **`lean`** (default) | Calls the club's public LMS API (`…-lms-pub-api.league.ninja`) for seasons, division nav, standings, and schedules. **No browser, no LLM.** |
+| **`llm`** | Stagehand v4 + xAI Grok BYO callback: browser extract on standings and each schedule week. Use when the API shape changes or you want an LLM fallback path. |
 
-## Requirements
+Set in `config.yaml` (`mode: lean|llm`) or override with `SCRAPE_MODE=lean|llm`.
 
-- **Node.js 22.18 or newer**, which Stagehand v4 requires (it uses the built-in `WebSocket`). Node 20 fails with `WebSocket is not defined`.
-- Google Chrome installed (for local mode).
-- pnpm (or npm).
+Multi-division discovery: set `levels: ["Beer A", "Beer B"]` (plus `siteUrl`). The scraper picks the current season, filters matching divisions, matches captains across all of them, and merges games. Single-division `leagueUrl` mode still works when `levels` is empty.
+
+## Entrypoints
+
+- **Python (preferred):** `python/main.py` — lean + llm, token usage summary, multi-div.
+- **TypeScript:** `index.ts` — older Stagehand path (being removed; see the `python-only` PR).
 
 ## Config (`config.yaml`)
 
-Edit **`config.yaml`** to change the captain, team, day, league label, or division URL. Copy from `config.example.yaml` if you need a fresh template (`cp config.example.yaml config.yaml`). Both files are commented; lines starting with `#` are ignored. Keep string values in double quotes so characters like `:` or `#` are never misread.
+Copy `config.example.yaml` → `config.yaml`. You must set at least one of `captainName` or `teamName`.
 
 | Field | Required | Purpose |
 |---|---|---|
-| `captainName` | one of captain/team | Captain(s) to search for on the standings page. **String or YAML list** (e.g. `"H. Robinson"` or `["H. Robinson", "R Baas"]`). Case- and punctuation-insensitive partial match (`"Robinson"` → `"H. Robinson"`; `"R Baas"` → `"R. Baas"`). |
-| `teamName` | one of captain/team | Explicit team name. Used only when `captainName` is empty/absent. Ignored for discovery while `captainName` is set. |
-| `day` | yes | Game day label (e.g. `"Sunday"`) — stored in output for convenience |
-| `league` | yes | Human-readable league / division path for your own notes |
-| `leagueUrl` | yes | Division standings URL (the script appends the schedule suffix) |
-| `model` | no | xAI Grok model id (default `grok-4-fast-reasoning`). Overridden by `STAGEHAND_MODEL`. |
-| `schedulePathSuffix` | no | Default `"/schedule"` |
+| `captainName` | one of captain/team | String or YAML list. Case- and punctuation-insensitive (`"R Baas"` ≡ `"R. Baas"`). |
+| `teamName` | one of captain/team | Used only when `captainName` is empty. |
+| `mode` | no | `lean` (default) or `llm`. |
+| `levels` | no | Substrings to match in league/division names (e.g. `Beer A`, `Beer B`). Enables multi-div. |
+| `siteUrl` | with levels | Club origin, e.g. `https://flannagans.league.ninja`. |
+| `apiBaseUrl` | no | Override pub API base (inferred for known clubs from `siteUrl`/`leagueUrl`). |
+| `leagueUrl` | single-div | Division standings URL when `levels` is empty. |
+| `day` / `league` | no | Notes for single-div; multi-div uses API day/leagueName per division. |
+| `model` | no | xAI Grok id (default `grok-4-fast-reasoning`). Overridden by `STAGEHAND_MODEL`. |
+| `schedulePathSuffix` | no | Default `"/schedule"` (llm mode). |
 
-You must set **at least one** of `captainName` or `teamName`.
-
-Example (captain-driven — string or list; recommended when you know the captain from standings):
-
-```yaml
-captainName:
-  - "H. Robinson"
-  - "Ryan Baas"
-  - "R. Baas"
-  - "R Baas"
-# Or a single string: captainName: "H. Robinson"
-teamName: "Win or Lose We Booze"
-day: "Sunday"
-league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
-leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
-schedulePathSuffix: "/schedule"
-```
-
-Example (team-only — leave `captainName` empty or omit it):
-
-```yaml
-teamName: "Win or Lose We Booze"
-day: "Sunday"
-league: "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E"
-leagueUrl: "https://flannagans.league.ninja/leagues/division/8f285cc6-16d2-43ff-88ad-66a2d8a41b9a"
-```
-
-`leagueUrl` should be the division page (the Standings tab). The script builds the schedule URL from `leagueUrl` + `schedulePathSuffix`.
-
-If `config.yaml` is missing, not valid YAML, or fails validation, the scraper exits with a clear error before launching Chrome.
-
-### Team resolution
-
-| Config | Behavior |
-|---|---|
-| `captainName` set (non-empty) | Prefer captain discovery. Extract all standings rows, keep every team whose captain matches any entry in `captainName` (string or list; case- and punctuation-insensitive, partial). Scrape **all games** for every matched team. `teamName` in config is ignored for discovery while captain is set. |
-| `captainName` empty / omitted | Use `teamName` as an explicit override. Match that team on the standings page (exact, then case-insensitive substring). |
-
-If a captain captains more than one team in the division, every matching team is included and their games are merged into one `games` array (each game has a `team` field).
-
-## Environment variables
+## Environment
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `XAI_API_KEY` | yes (local mode) | xAI key for Grok. Stagehand v4 has no native xAI provider, so `index.ts` calls Grok through a BYO LLM callback (OpenAI-compatible client at `https://api.x.ai/v1`). |
-| `BROWSERBASE_API_KEY` | optional | Uses `browserbase.launch()` (a cloud browser) instead of local Chrome. If `XAI_API_KEY` isn't set, Browserbase's Model Gateway picks the model. |
-| `STAGEHAND_MODEL` | optional | Overrides `config.yaml` `model`. Default: `grok-4-fast-reasoning`. |
-| `HEADLESS` | optional | Set to `false` to watch the Chrome window. |
+| `XAI_API_KEY` | llm / local Stagehand | xAI key for Grok (OpenAI-compatible client at `https://api.x.ai/v1`). |
+| `BROWSERBASE_API_KEY` | optional | Cloud browser (+ Model Gateway if no xAI key). |
+| `STAGEHAND_MODEL` | optional | Overrides `config.model`. |
+| `SCRAPE_MODE` | optional | Overrides `config.mode` (`lean`\|`llm`). |
+| `SCRAPE_LLM_PREFILTER` | optional | Multi-div llm: `1` (default) HTTP-prefilters standings so Stagehand only runs on divisions with captain/team hits; `0` disables. |
+| `HEADLESS` | optional | `false` to show Chrome (llm mode). |
 
-Set these in your shell, or copy `.env.example` to `.env` (it's git-ignored) and use `pnpm scrape:env`. Don't commit keys.
+Lean mode does not need `XAI_API_KEY`. Put secrets in `.env` (gitignored) at the repo root or `python/.env`.
 
-The Stagehand LLM model itself is also configurable in **`config.yaml`** via the `model` field (default `grok-4-fast-reasoning`, which supports structured outputs and tool use on xAI).
-
-## Run
+## Run (Python)
 
 ```bash
-pnpm install
-export XAI_API_KEY=...   # or: cp .env.example .env and fill it in
-pnpm scrape                 # or: pnpm scrape:env  (loads .env)
+cd python
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+# lean (default): no API key needed
+python main.py
+# llm:
+SCRAPE_MODE=llm export XAI_API_KEY=...
+python main.py
 ```
 
-With npm: `npm install` then `npm run scrape`.
+Output: JSON on stdout and `python/games.json`. Each run prints an LLM usage summary (`calls`, prompt/completion/total tokens, estimated USD from published xAI rates). Output omits JSON `null` keys; `scrapedAt` is UTC with millisecond precision (`…Z`).
 
-Type-check only: `pnpm typecheck`.
+## Team resolution
 
-## Example output (shape)
+Same rules in lean and llm: prefer `captainName` (any list entry, punctuation-insensitive); else `teamName`. In multi-div mode, a miss in one division is fine — only a miss across **all** scanned divisions fails.
 
-```json
-{
-  "captainSearched": "H. Robinson",
-  "resolution": "captain",
-  "matchedTeams": [
-    {
-      "teamName": "Win or Lose We Booze",
-      "captainName": "H. Robinson",
-      "record": "2-3",
-      "standing": "4"
-    }
-  ],
-  "team": "Win or Lose We Booze",
-  "day": "Sunday",
-  "league": "Summer III- 2026 › Sunday Coed Sixes- Beer A- Evening › Sunday Beer (A)- Court E",
-  "url": "https://flannagans.league.ninja/leagues/division/...",
-  "scrapedAt": "2026-10-05T17:45:00.000Z",
-  "leagueName": "Summer III- 2026",
-  "divisionName": "Sunday Coed Sixes- Beer A- EVENING (5:00-7:00PM)",
-  "teamRecord": "2-3",
-  "teamStanding": "4",
-  "games": [
-    {
-      "date": "Sun, Oct 04", "time": "6:00 pm", "week": "LEAGUE ROUND Week 5 - Oct 4",
-      "team": "Win or Lose We Booze",
-      "opponent": "Tipsy Tippers", "location": "Outdoors - Court E",
-      "status": "completed", "result": "Winner - Win or Lose We Booze"
-    },
-    {
-      "date": "Sun, Oct 11", "time": "5:00 pm", "week": "LEAGUE ROUND Week 6 - Oct 11",
-      "team": "Win or Lose We Booze",
-      "opponent": "Spike of the Beast", "location": "The Fieldhouse - Court B",
-      "status": "scheduled"
-    }
-  ],
-  "roundsWithoutTeamGames": ["TOURNAMENT Oct 18"]
-}
-```
+## License
 
-When resolving by captain, `captainSearched` is the config string you searched for and `matchedTeams` lists every standings row that matched. When using `teamName` only, `captainSearched` is `null` and `resolution` is `"teamName"`.
-
-## Python version
-
-A thoroughly commented Python port lives in [`python/`](./python/), using the Stagehand Python SDK (`pip install stagehand`) with the same act / extract / observe flow and the same shared `config.yaml`. See [`python/README.md`](./python/README.md).
-
+Private / personal use unless otherwise noted.
