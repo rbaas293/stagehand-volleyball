@@ -24,8 +24,10 @@ levels:
 
 siteUrl: "https://flannagans.league.ninja"
 
-# Optional: force a season by exact name or uid. When empty, pick the active
-# season by date (in-range preferred; else latest startDate).
+# Optional season override (exact name, substring, or uid). When empty, auto-pick
+# prefers an in-range season that has divisions matching levels[] above — so a
+# newer empty overlap (e.g. Fall 2026 with no Beer A/B yet) does not win over
+# Summer III. Force a season if auto-pick is wrong:
 # season: "Summer III- 2026"
 
 day: "Sunday"

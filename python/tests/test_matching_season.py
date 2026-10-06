@@ -114,3 +114,96 @@ def test_pick_current_season_fallback_latest_start():
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     # Neither in range → latest startDate
     assert pick_current_season(seasons, now=now)["uid"] == "b"
+
+
+def test_pick_season_for_levels_skips_empty_fall_oct26():
+    """
+    Live failure mode: on ~Oct 26, Summer III and Fall both in-range; Fall has the
+    later startDate but 0 Beer A/B divisions → must fall back to Summer III.
+    """
+    from lean_api import pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "summer-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+        {
+            "uid": "fall-uid",
+            "name": "Fall 2026",
+            # Starts ~Oct 25 16:00 UTC → later start than Summer; both in range on Oct 26.
+            "startDate": "2026-10-25T16:00:00",
+            "endDate": "2027-01-15T00:00:00",
+        },
+    ]
+    now = datetime(2026, 10, 26, 18, 0, 0, tzinfo=timezone.utc)
+    levels = ["Beer A", "Beer B"]
+
+    def fake_list(_api: str, uid: str):
+        if uid == "fall-uid":
+            return [
+                {"divisionUid": "f1", "divisionName": "Thursday Open", "leagueName": "Fall Open"},
+            ]
+        return [
+            {
+                "divisionUid": "s1",
+                "divisionName": "Sunday Beer (A)- Court E",
+                "leagueName": "Summer III Beer A",
+            },
+            {
+                "divisionUid": "s2",
+                "divisionName": "Friday Beer (B)- Court H",
+                "leagueName": "Summer III Beer B",
+            },
+        ]
+
+    logs: list[str] = []
+    season, matched, reason = pick_season_for_levels(
+        "https://api.example",
+        seasons,
+        levels,
+        now=now,
+        list_divisions=fake_list,
+        log_fn=logs.append,
+    )
+    assert season["uid"] == "summer-uid"
+    assert len(matched) == 2
+    assert "Fall" in reason or "skipped" in reason.lower()
+    assert any("Season pick" in m or "skipped" in m.lower() for m in logs) or "skipped" in reason.lower()
+
+
+def test_pick_season_for_levels_override_skips_fallback():
+    from lean_api import pick_season_for_levels
+
+    seasons = [
+        {
+            "uid": "summer-uid",
+            "name": "Summer III- 2026",
+            "startDate": "2026-07-01T00:00:00",
+            "endDate": "2026-12-15T00:00:00",
+        },
+        {
+            "uid": "fall-uid",
+            "name": "Fall 2026",
+            "startDate": "2026-10-25T16:00:00",
+            "endDate": "2027-01-15T00:00:00",
+        },
+    ]
+
+    def fake_list(_api: str, uid: str):
+        if uid == "fall-uid":
+            return [{"divisionUid": "f1", "divisionName": "Open", "leagueName": "Open"}]
+        return [
+            {"divisionUid": "s1", "divisionName": "Beer A", "leagueName": "Beer A"},
+        ]
+
+    with pytest.raises(LeanApiError, match='season="Fall 2026"'):
+        pick_season_for_levels(
+            "https://api.example",
+            seasons,
+            ["Beer A"],
+            season="Fall 2026",
+            list_divisions=fake_list,
+        )

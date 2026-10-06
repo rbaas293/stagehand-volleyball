@@ -13,7 +13,7 @@ Default config searches captains **H. Robinson** / **R. Baas** / **Ryan Baas** a
 
 Set in `config.yaml` (`mode: lean|llm`) or override with `SCRAPE_MODE=lean|llm`.
 
-Multi-division discovery: set `levels: ["Beer A", "Beer B"]` (plus `siteUrl`). The scraper picks the current season, filters matching divisions, matches captains across all of them, and merges games. Single-division `leagueUrl` mode still works when `levels` is empty.
+Multi-division discovery: set `levels: ["Beer A", "Beer B"]` (plus `siteUrl`). The scraper picks an **active/in-range season that has divisions matching those levels** (so a newer empty overlap like Fall does not win over Summer III). Set `season` to force a name or uid. Single-division `leagueUrl` mode still works when `levels` is empty.
 
 ## Entrypoints
 
@@ -32,6 +32,7 @@ Copy `config.example.yaml` → `config.yaml`. You must set at least one of `capt
 | `levels` | no | Substrings to match in league/division names (e.g. `Beer A`, `Beer B`). Enables multi-div. |
 | `siteUrl` | with levels | Club origin, e.g. `https://flannagans.league.ninja`. |
 | `apiBaseUrl` | no | Override pub API base (inferred for known clubs from `siteUrl`/`leagueUrl`). |
+| `season` | no | Optional season **name or uid** override. When empty, auto-pick prefers in-range seasons that have divisions matching `levels` (falls back if the newest overlap has none). |
 | `leagueUrl` | single-div | Division standings URL when `levels` is empty. |
 | `day` / `league` | no | Notes for single-div; multi-div uses API day/leagueName per division. |
 | `model` | no | xAI Grok id (default `grok-4-fast-reasoning`). Overridden by `STAGEHAND_MODEL`. |
@@ -67,7 +68,7 @@ Output: JSON on stdout and `python/games.json`. Each run prints an LLM usage sum
 
 ## Team resolution
 
-Same rules in lean and llm: prefer `captainName` (any list entry, punctuation-insensitive); else `teamName`. In multi-div mode, a miss in one division is fine — only a miss across **all** scanned divisions fails.
+Same rules in lean and llm: prefer `captainName` (exact after normalizing punctuation/case; `"R Baas"` ≡ `"R. Baas"`, no substrings); else exact `teamName`. In multi-div mode, a miss in one division is fine — only a miss across **all** scanned divisions fails. Resolve errors name the season scanned and hint at the `season` config override.
 
 ## License
 
